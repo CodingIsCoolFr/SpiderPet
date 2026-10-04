@@ -61,7 +61,7 @@ Only the find leaves your PC (an id, a title or a few search words), never the p
 2. Download **SpiderPet.exe** and **SpiderHost.exe** from the [latest release](https://github.com/CodingIsCoolFr/SpiderPet/releases/latest) into one folder and run SpiderPet.exe once. It tells your browsers where it is.
 3. Add the extension:
    - **Brave, Chrome, Edge:** unzip `spiderpet-chromium.zip`, open `brave://extensions` (or `chrome://`, `edge://`), turn on Developer mode, click **Load unpacked** and pick the folder.
-   - **Firefox:** drag `spiderpet-firefox.xpi` into a Firefox window and click **Add**. (Building it yourself: `extension\sign-firefox.ps1` gets it signed by Mozilla with your free addons.mozilla.org API key.)
+   - **Firefox:** Firefox only keeps extensions that Mozilla has signed. Run `extension\sign-firefox.ps1` once with your free addons.mozilla.org API key; it makes `spiderpet-firefox.xpi`, which you drag into Firefox. To try it first without signing: unzip `spiderpet-firefox-unsigned.zip`, open `about:debugging` → This Firefox → **Load Temporary Add-on**, and pick its `manifest.json` (it lasts until Firefox restarts).
 4. On any page, click the spider button in the toolbar, or press **Alt + Shift + S**.
 
 The app sits in the tray while the browser is connected. Close its window and it keeps working; quit from the tray icon.
