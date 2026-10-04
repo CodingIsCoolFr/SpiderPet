@@ -30,6 +30,10 @@ if (-not $Secret) {
   $s = Read-Host "API secret" -AsSecureString
   $Secret = [Runtime.InteropServices.Marshal]::PtrToStringBSTR([Runtime.InteropServices.Marshal]::SecureStringToBSTR($s))
 }
+# Forgiving with copy and paste: stray spaces, and the "user:" Mozilla's key starts with.
+$Key = $Key.Trim()
+$Secret = $Secret.Trim()
+if ($Key -match '^\d+:\d+$') { $Key = "user:$Key" }
 
 function B64Url([byte[]]$b) { [Convert]::ToBase64String($b).TrimEnd("=").Replace("+", "-").Replace("/", "_") }
 function Jwt {
