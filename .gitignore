@@ -1,0 +1,5 @@
+build/
+.vs/
+*.user
+SpiderPet.exe
+SpiderPet.old.exe
