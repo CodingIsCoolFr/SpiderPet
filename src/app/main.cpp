@@ -495,7 +495,24 @@ int App::matches(const json& f) const {
   return n;
 }
 
-void App::on_message(int client, const json& m) {
+// Invisible marks that ask for a color emoji or glue emoji together (U+FE0E,
+// U+FE0F, U+200D). The app draws emoji in one color, where they only leave gaps.
+static std::string drop_marks(std::string s) {
+  for (const char* mark : {"\xEF\xB8\x8E", "\xEF\xB8\x8F", "\xE2\x80\x8D"})
+    for (size_t at; (at = s.find(mark)) != std::string::npos;) s.erase(at, 3);
+  return s;
+}
+
+static json without_marks(const json& j) {
+  if (j.is_string()) return drop_marks(j.get<std::string>());
+  if (!j.is_structured()) return j;
+  json out = j;
+  for (json& v : out) v = without_marks(v);
+  return out;
+}
+
+void App::on_message(int client, const json& raw) {
+  const json m = without_marks(raw);
   const std::string type = jstr(m, "type");
   std::unique_lock lock(mu_);
   if (type == "hello") {

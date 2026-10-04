@@ -1,13 +1,13 @@
 # Rebuilds SpiderPet and puts SpiderPet.exe, SpiderHost.exe and the browser
 # extension (extension\chromium, extension\firefox) next to this script.
-# Needs Visual Studio 2022 (C++), CMake, and vcpkg with imgui and nlohmann-json
-# for x64-windows. vcpkg is found through VCPKG_ROOT or ~\vcpkg.
+# Needs Visual Studio 2022 (C++), CMake and vcpkg (found through VCPKG_ROOT or
+# ~\vcpkg). vcpkg.json lists the libraries; the first build installs them into build\.
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
 $vcpkg = if ($env:VCPKG_ROOT) { $env:VCPKG_ROOT } else { Join-Path $env:USERPROFILE "vcpkg" }
 $toolchain = Join-Path $vcpkg "scripts\buildsystems\vcpkg.cmake"
 if (-not (Test-Path $toolchain)) { throw "vcpkg not found. Set VCPKG_ROOT to your vcpkg folder." }
-cmake -S $root -B "$root\build" -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=$toolchain"
+cmake -S $root -B "$root\build" -G "Visual Studio 17 2022" -A x64 "-DCMAKE_TOOLCHAIN_FILE=$toolchain" "-DVCPKG_MANIFEST_MODE=ON"
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 cmake --build "$root\build" --config Release
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }

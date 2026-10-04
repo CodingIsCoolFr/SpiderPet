@@ -1,0 +1,9 @@
+{
+  "name": "spiderpet",
+  "version-string": "3.2.0",
+  "description": "SpiderPet's own copy of its libraries. ImGui with 32-bit characters, so emoji and every script show in the app, without changing the ImGui other projects on the PC use.",
+  "dependencies": [
+    { "name": "imgui", "features": ["wchar32"] },
+    "nlohmann-json"
+  ]
+}

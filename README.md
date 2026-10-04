@@ -69,10 +69,9 @@ The app sits in the tray. Close its window and it keeps working; quit from the t
 
 ## Build from source
 
-Needs Visual Studio 2022 (C++), CMake 3.21+ and [vcpkg](https://vcpkg.io) with `imgui` and `nlohmann-json` for `x64-windows`.
+Needs Visual Studio 2022 (C++), CMake 3.21+ and [vcpkg](https://vcpkg.io) (set `VCPKG_ROOT`). The libraries are listed in `vcpkg.json` (ImGui with 32-bit characters for emoji, nlohmann/json); the first build installs them into `build\`.
 
 ```powershell
-vcpkg install imgui nlohmann-json --triplet x64-windows
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
