@@ -10,12 +10,13 @@
 </p>
 
 <p align="center">
-  <b>Drop a spider on any web page. It walks across the text, harvests the DOIs, ISBNs, paper ids, titles,<br>
-  links and key facts, restyles them right in the page, and checks every one against a real source.</b>
+  <b>Type what you are looking for, and a spider drops onto the page you have open and hunts for it. It walks<br>
+  across the text, harvests the DOIs, ISBNs, paper ids, titles, links and key facts, restyles them right in<br>
+  the page, and checks every one against a real source.</b>
 </p>
 
 <p align="center">
-  <img src="docs/media/page.png" alt="The spider on a reference list: DOIs in green code, ISBNs in big blue, ids as tags, titles in salmon, each with a verified badge" width="820">
+  <img src="docs/media/page.png" alt="The spider hunting for 'silk' on the Wikipedia Spider page: every match lit up, the sentence it is reading underlined, its name and thought in a cloud" width="820">
 </p>
 
 ---
@@ -23,10 +24,13 @@
 ## What it does
 
 - **Reads the real page.** It runs inside the browser and reads the page itself, so every DOI, title and sentence is spelled exactly as written. Nothing is guessed from pixels. Hidden text, menus, cookie banners and ads are left out.
-- **Walks to what matters.** Eight jointed legs, a magenta lasso, bursts of speed like a real spider. It goes for what you are looking for first, reads key sentences with a sweep, and scrolls the page by itself.
+- **Hunts for what you ask.** Type what you are looking for in the SpiderPet app. The spider drops onto the page you have open, every match on the page lights up at once, and it goes from match to match down the page. The local AI adds synonyms a moment later.
+- **Walks like a spider.** Eight jointed legs, a magenta lasso, bursts of speed, a thought cloud with its name, silk between the things it ate. Without a search it reads the key sentences of the page with a sweep and scrolls by itself.
+- **One control center.** Everything is in the SpiderPet app: the search, Start/Stop spider, what it found on the page you are looking at, and the library. The browser needs no menus.
 - **Restyles the real text.** Like the clip that inspired it: DOIs turn into green code, ISBNs into big blue code, ids into tags, titles into salmon serif, links get a frame. The page itself changes; nothing is painted over it.
 - **Checks everything.** Each find gets a badge in the page: **✓ verified**, **⚠ wrong**, **✗ not found**, **? unclear**, **opinion** or **ad**. Hover for the reason and the source; click to open the source.
 - **Keeps a library.** The SpiderPet app keeps every find from every browser, with its check, its source and the page it came from. Search it, filter it, save it as JSON or CSV.
+- **Stays out of the way.** It draws at most 60 frames a second and re-reads a page only when the page really changed. Before it loads the AI it checks free graphics memory: when a game or VRChat has taken it, the AI waits instead of making your PC stutter, and ids and titles are still checked online.
 
 ## How the checking works
 
@@ -44,16 +48,10 @@ The AI also sorts sentences into facts, opinions and advertising, writes a short
 
 Only the find leaves your PC (an id, a title or a few search words), never the page. Turn **Online checks** off in the app and nothing leaves at all.
 
-<table>
-  <tr>
-    <td width="50%"><img src="docs/media/panel.png" alt="The side panel: page summary, finds with verdicts and sources"></td>
-    <td width="50%"><img src="docs/media/app.png" alt="The SpiderPet app: status, goal, tabs"></td>
-  </tr>
-  <tr>
-    <td align="center"><sub>the side panel in the browser</sub></td>
-    <td align="center"><sub>the SpiderPet app: the library and the brain</sub></td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/media/app.png" alt="The SpiderPet app: the search, Start/Stop spider, the tab you are on, and the finds that match with their checks" width="420"><br>
+  <sub>the SpiderPet app: the search, the spider's switch, and every find with its check</sub>
+</p>
 
 ## Install
 
@@ -61,10 +59,10 @@ Only the find leaves your PC (an id, a title or a few search words), never the p
 2. Download **SpiderPet.exe** and **SpiderHost.exe** from the [latest release](https://github.com/CodingIsCoolFr/SpiderPet/releases/latest) into one folder and run SpiderPet.exe once. It tells your browsers where it is.
 3. Add the extension:
    - **Brave, Chrome, Edge:** unzip `spiderpet-chromium.zip`, open `brave://extensions` (or `chrome://`, `edge://`), turn on Developer mode, click **Load unpacked** and pick the folder.
-   - **Firefox:** Firefox only keeps extensions that Mozilla has signed. Run `extension\sign-firefox.ps1` once with your free addons.mozilla.org API key; it makes `spiderpet-firefox.xpi`, which you drag into Firefox. To try it first without signing: unzip `spiderpet-firefox-unsigned.zip`, open `about:debugging` → This Firefox → **Load Temporary Add-on**, and pick its `manifest.json` (it lasts until Firefox restarts).
-4. On any page, click the spider button in the toolbar, or press **Alt + Shift + S**.
+   - **Firefox:** install SpiderPet from [addons.mozilla.org](https://addons.mozilla.org) once it is listed there (`extension\sign-firefox.ps1` sends it to Mozilla's store). Before that: unzip `spiderpet-firefox-unsigned.zip`, open `about:debugging` → This Firefox → **Load Temporary Add-on**, and pick its `manifest.json` (it lasts until Firefox restarts).
+4. Open a page. In the SpiderPet window, type what you are looking for: the spider drops onto that page and hunts for it. Or press **Start spider**. The spider button in the browser toolbar (**Alt + Shift + S**) does the same.
 
-The app sits in the tray while the browser is connected. Close its window and it keeps working; quit from the tray icon.
+The app sits in the tray. Close its window and it keeps working; quit from the tray icon. The browser connects by itself whenever the app is running.
 
 ## Build from source
 
@@ -78,13 +76,13 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 That builds `SpiderPet.exe`, `SpiderHost.exe` and the extension (`extension\chromium`, `extension\firefox`).
 
 ```
-extension/src   the spider in the page: reading, walking, restyling, badges, the side panel
+extension/src   the spider in the page: reading, walking, hunting, restyling, badges
 src/app         SpiderPet.exe (window, tray, library), SpiderHost.exe (the browser's bridge)
 src/mind        the checker: Crossref, OpenLibrary, PubMed, arXiv, Wikipedia, and the local model
 src/core        small helpers
 ```
 
-The browser starts SpiderHost.exe (native messaging); it relays everything over a private named pipe to SpiderPet.exe, which owns the library and the checks.
+The browser starts SpiderHost.exe (native messaging); it relays everything over a private named pipe to SpiderPet.exe, which owns the library, the checks and the controls. When the app is not running, SpiderHost waits for it, so the app can send the spider out the moment you start it.
 
 ## Privacy
 

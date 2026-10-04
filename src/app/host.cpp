@@ -1,7 +1,9 @@
 // SpiderHost.exe: the browser starts this (native messaging) when the
 // extension connects. It relays every message, unchanged, between the
-// browser and the SpiderPet app over a named pipe, and starts the app in the
-// tray if it is not running.
+// browser and the SpiderPet app over a named pipe. When the app is not
+// running it waits for it, so the app can drive the browser the moment you
+// start it; it starts the app itself only when the browser asks for it (you
+// pressed the spider button, or a spider has something to check).
 //
 //   SpiderHost.exe --register    tell the browsers where this file is
 #include "app/bridge.hpp"
@@ -10,6 +12,8 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -39,7 +43,10 @@ bool write_std(HANDLE h, const void* data, DWORD size) {
   return true;
 }
 
+std::mutex out_mu;
+
 void to_browser(HANDLE out, const std::string& msg) {
+  std::lock_guard lock(out_mu);
   const uint32_t len = static_cast<uint32_t>(msg.size());
   write_std(out, &len, 4);
   write_std(out, msg.data(), len);
@@ -90,32 +97,66 @@ int wmain(int argc, wchar_t** argv) {
 
   HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
   HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
-  HANDLE pipe = open_pipe();
-  if (pipe == INVALID_HANDLE_VALUE && start_app()) {
-    for (int i = 0; i < 80 && pipe == INVALID_HANDLE_VALUE; ++i) {
-      Sleep(100);
-      pipe = open_pipe();
+  std::mutex mu;
+  HANDLE pipe = INVALID_HANDLE_VALUE;
+  std::deque<std::string> backlog;  // what the browser said before the app was there
+  bool started = false;
+  double started_at = 0;
+
+  // Browser -> app on its own thread. Until the app is there, messages wait,
+  // and anything but a quiet hello starts it.
+  std::thread from_browser([&] {
+    for (;;) {
+      uint32_t len = 0;
+      if (!read_std(in, &len, 4) || len > 64u * 1024 * 1024) break;
+      std::string msg(len, '\0');
+      if (len && !read_std(in, msg.data(), len)) break;
+      const nlohmann::json j = nlohmann::json::parse(msg, nullptr, false);
+      const std::string type = j.is_object() ? j.value("type", "") : "";
+      const bool wake = type == "wake" || type != "hello" || (j.is_object() && j.value("start", true));
+      std::unique_lock lock(mu);
+      if (pipe != INVALID_HANDLE_VALUE) {
+        if (type != "wake" && !write_frame(pipe, msg)) break;
+        continue;
+      }
+      if (type != "wake") backlog.push_back(std::move(msg));
+      if (wake && !started) {
+        started = true;
+        started_at = now_seconds();
+        lock.unlock();
+        if (!start_app()) to_browser(out, R"({"type":"error","text":"SpiderPet.exe could not be started."})");
+      }
     }
-  }
-  if (pipe == INVALID_HANDLE_VALUE) {
-    to_browser(out, R"({"type":"error","text":"SpiderPet.exe is not running and could not be started."})");
-    return 1;
+    // The browser closed the connection.
+    ExitProcess(0);
+  });
+
+  // Wait for the app: quickly once it is starting, gently otherwise.
+  bool warned = false;
+  for (;;) {
+    HANDLE h = open_pipe();
+    if (h != INVALID_HANDLE_VALUE) {
+      std::lock_guard lock(mu);
+      for (const std::string& m : backlog) write_frame(h, m);
+      backlog.clear();
+      pipe = h;
+      break;
+    }
+    bool starting;
+    {
+      std::lock_guard lock(mu);
+      starting = started;
+      if (started && !warned && now_seconds() - started_at > 10) {
+        warned = true;
+        to_browser(out, R"({"type":"error","text":"SpiderPet.exe is not answering."})");
+      }
+    }
+    Sleep(starting ? 100 : 700);
   }
 
-  // App -> browser on its own thread; browser -> app here.
-  std::thread back([pipe, out] {
-    std::string frame;
-    while (read_frame(pipe, frame)) to_browser(out, frame);
-    ExitProcess(0);  // the app went away: let the extension reconnect
-  });
-  for (;;) {
-    uint32_t len = 0;
-    if (!read_std(in, &len, 4) || len > 64u * 1024 * 1024) break;
-    std::string msg(len, '\0');
-    if (len && !read_std(in, msg.data(), len)) break;
-    if (!write_frame(pipe, msg)) break;
-  }
-  // The browser closed the connection.
-  CloseHandle(pipe);
+  // App -> browser here. When the app goes away, so does this host; the
+  // extension reconnects and the next host waits for the app again.
+  std::string frame;
+  while (read_frame(pipe, frame)) to_browser(out, frame);
   ExitProcess(0);
 }

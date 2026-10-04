@@ -2,6 +2,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <map>
 #include <mutex>
 #include <string>
 
@@ -36,8 +38,13 @@ class Checker {
   void set_model(const std::string& name);  // empty = pick the best installed
   // How well each item answers what the user is looking for, 0..10.
   nlohmann::json rank(const std::string& goal, const std::string& title, const nlohmann::json& items);
+  // Search terms (synonyms, plurals, related names) for what the user typed.
+  nlohmann::json expand(const std::string& goal);
   // One sentence, up to three key points, and what kind of page it is.
   nlohmann::json gist(const std::string& title, const std::string& url, const std::string& text);
+  // True for a while after the model got squeezed out of the graphics card
+  // (another app took the memory): model work waits, so the PC stays smooth.
+  bool gpu_busy() const;
 
  private:
   nlohmann::json check_doi(const std::string& doi, const std::string& context);
@@ -51,6 +58,7 @@ class Checker {
   nlohmann::json ask(const std::string& system, const std::string& user, const nlohmann::json& schema,
                      int max_tokens = 300);
   std::string pick_model();
+  bool fits(const std::string& model);
   void load_cache();
   void save_cache();
 
@@ -60,6 +68,9 @@ class Checker {
   std::string model_;
   std::string wanted_;
   double model_at_ = -100;
+  std::atomic<double> slow_until_{0};
+  int strikes_ = 0;                          // slow answers in a row
+  std::map<std::string, long long> sizes_;  // model -> bytes it takes in graphics memory
 };
 
 }  // namespace sp

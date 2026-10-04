@@ -3,6 +3,8 @@
 #include "core/util.hpp"
 #include "mind/net.hpp"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -194,6 +196,7 @@ std::string Checker::pick_model() {
       // "name:latest" and "name" are the same model.
       if (n.size() > 7 && n.compare(n.size() - 7, 7, ":latest") == 0) n.resize(n.size() - 7);
       have.push_back(n);
+      if (!sizes_.count(n)) sizes_[n] = static_cast<long long>(m.value("size", 0.0) * 0.94);  // the file, less what text checks never load
     }
   model_.clear();
   if (!wanted.empty() && std::find(have.begin(), have.end(), wanted) != have.end()) return model_ = wanted;
@@ -222,20 +225,103 @@ json Checker::status() {
   return out;
 }
 
+bool Checker::gpu_busy() const { return now_seconds() < slow_until_.load(); }
+
+namespace {
+
+// Free graphics memory in bytes, from the NVIDIA driver; -1 without one.
+long long free_vram() {
+  struct Mem {
+    unsigned long long total, free, used;
+  };
+  using Init = int (*)();
+  using Handle = int (*)(unsigned, void**);
+  using Info = int (*)(void*, Mem*);
+  static const HMODULE dll = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!dll) return -1;
+  static const auto init = reinterpret_cast<Init>(GetProcAddress(dll, "nvmlInit_v2"));
+  static const auto handle = reinterpret_cast<Handle>(GetProcAddress(dll, "nvmlDeviceGetHandleByIndex_v2"));
+  static const auto info = reinterpret_cast<Info>(GetProcAddress(dll, "nvmlDeviceGetMemoryInfo"));
+  static const bool ok = init && handle && info && init() == 0;
+  void* dev = nullptr;
+  Mem m{};
+  if (!ok || handle(0, &dev) != 0 || info(dev, &m) != 0) return -1;
+  return static_cast<long long>(m.free);
+}
+
+}  // namespace
+
+// Whether the model can sit in graphics memory next to everything open now.
+// One that does not fit spills into main memory, writes a word every few
+// seconds and keeps the card at full load, so it is better not loaded at all.
+bool Checker::fits(const std::string& model) {
+  std::string body;
+  if (local_http("GET", "/api/ps", nullptr, body, 2000) == 200) {
+    const json ps = json::parse(body, nullptr, false);
+    if (ps.is_object() && ps.contains("models") && ps["models"].is_array())
+      for (const json& m : ps["models"]) {
+        std::string n = str(m, "name");
+        if (n.size() > 7 && n.compare(n.size() - 7, 7, ":latest") == 0) n.resize(n.size() - 7);
+        if (n != model) continue;
+        sizes_[model] = static_cast<long long>(m.value("size", 0.0));  // measured: weights and working memory
+        return true;                                                    // already loaded: the speed check watches it
+      }
+  }
+  const long long free = free_vram();
+  const auto it = sizes_.find(model);
+  if (free < 0 || it == sizes_.end() || it->second <= 0) return true;  // no way to tell: try it
+  return free >= it->second + 800ll * 1024 * 1024;                      // and room for the rest of the PC to breathe
+}
+
 json Checker::ask(const std::string& system, const std::string& user, const json& schema, int max_tokens) {
+  if (gpu_busy()) return nullptr;
   const std::string model = pick_model();
   if (model.empty()) return nullptr;
+  if (!fits(model)) {
+    slow_until_ = now_seconds() + 30;  // look again in half a minute: you may have closed something
+    return nullptr;
+  }
   json req = {{"model", model},
               {"stream", false},
               {"format", schema},
+              {"keep_alive", "2m"},  // the graphics card memory comes back soon after the spider stops
               {"messages", json::array({{{"role", "system"}, {"content", system}}, {{"role", "user"}, {"content", user}}})},
               {"options", {{"temperature", 0}, {"num_ctx", 8192}, {"num_predict", max_tokens}}}};
   // Qwen3 thinks out loud by default; a verdict does not need it.
   if (model.rfind("qwen3", 0) == 0) req["think"] = false;
   const std::string body = req.dump(-1, ' ', false, json::error_handler_t::replace);
   std::string out;
-  if (local_http("POST", "/api/chat", &body, out, 120000) != 200) return nullptr;
+  const double t0 = now_seconds();
+  const long code = local_http("POST", "/api/chat", &body, out, 60000);
+  // The model shares the graphics card with your browser. A short rest after
+  // each answer keeps scrolling and video smooth while the spider works.
+  const double took = now_seconds() - t0;
   json res = json::parse(out, nullptr, false);
+  // How fast it wrote. When another app (a game, VRChat) has taken graphics
+  // memory, the model no longer fits: it writes a word every few seconds and
+  // holds the card at full load, and everything on screen stutters. Then it
+  // leaves the card and rests for a minute and a half.
+  double load = 0, tps = -1;
+  int written = 0;
+  if (res.is_object()) {
+    load = res.value("load_duration", 0.0) / 1e9;
+    written = res.value("eval_count", 0);
+    const double gen = res.value("eval_duration", 0.0) / 1e9;
+    if (gen > 0) tps = written / gen;
+  }
+  const bool timed_out = code != 200 && took > 55;
+  if (timed_out || took - load > 40 || (written >= 8 && tps >= 0 && tps < 4)) {
+    // Each time in a row it rests longer: 1.5, 3, 6, then 12 minutes.
+    strikes_ = std::min(strikes_ + 1, 4);
+    slow_until_ = now_seconds() + 90.0 * (1 << (strikes_ - 1));
+    const std::string unload = json{{"model", model}, {"keep_alive", 0}}.dump();
+    std::string ignored;
+    local_http("POST", "/api/generate", &unload, ignored, 10000);
+  } else {
+    if (code == 200) strikes_ = 0;
+    Sleep(static_cast<DWORD>(std::min(1500.0, took * 400.0)));
+  }
+  if (code != 200) return nullptr;
   if (!res.is_object()) return nullptr;
   std::string content;
   try {
@@ -671,13 +757,29 @@ json Checker::rank(const std::string& goal, const std::string& title, const json
   return {{"scores", scores}};
 }
 
+json Checker::expand(const std::string& goal) {
+  const json schema = {{"type", "object"},
+                       {"properties", {{"terms", {{"type", "array"}, {"items", {{"type", "string"}}}, {"maxItems", 14}}}}},
+                       {"required", {"terms"}}};
+  const json j = ask(
+      "You help a reader search a web page. Give up to 14 short lowercase search terms (one to three words each) "
+      "that text matching their request would contain: the key words themselves, their singular and plural, "
+      "synonyms, and closely related names. Most important first.",
+      "The reader is looking for: " + goal, schema, 160);
+  json terms = json::array();
+  if (j.is_object() && j.contains("terms") && j["terms"].is_array())
+    for (const json& t : j["terms"])
+      if (t.is_string() && t.get<std::string>().size() >= 2 && t.get<std::string>().size() <= 40) terms.push_back(lower_ascii(t.get<std::string>()));
+  return terms;
+}
+
 json Checker::gist(const std::string& title, const std::string& url, const std::string& text) {
   const json schema = {
       {"type", "object"},
       {"properties",
        {{"summary", {{"type", "string"}}},
         {"points", {{"type", "array"}, {"items", {{"type", "string"}}}, {"maxItems", 3}}},
-        {"type", {{"type", "string"}, {"enum", {"reference", "research", "news", "opinion", "tutorial", "forum", "shop", "other"}}}}}},
+        {"type", {{"type", "string"}, {"enum", {"reference", "research", "news", "opinion", "tutorial", "forum", "social", "video", "shop", "other"}}}}}},
       {"required", {"summary", "points", "type"}}};
   const json j = ask(
       "You summarize a web page for a busy reader. summary: one plain sentence, at most 25 words. points: up to 3 "

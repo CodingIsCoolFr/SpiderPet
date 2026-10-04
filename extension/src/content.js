@@ -1,11 +1,12 @@
 // SpiderPet in the page: reads the real page (the DOM, so nothing is guessed),
 // walks to what matters with eight jointed legs, lassoes it, restyles the real
-// text and shows the check the SpiderPet app made for it.
+// text and shows the check the SpiderPet app made for it. With a search from
+// the app it hunts: matching words light up and it goes only for matches.
 (() => {
   'use strict';
   const api = globalThis.browser ?? globalThis.chrome;
-  // Injected again (the page finished loading, or you pressed the button):
-  // wake up if asleep, never switch off. Only the Stop button stops it.
+  // Injected again (the page finished loading, or the app said go): wake up
+  // if asleep, never switch off. Only a stop command stops it.
   if (window.__spiderpet) {
     window.__spiderpet.start();
     return;
@@ -24,6 +25,7 @@
   const mul = (a, k) => V(a.x * k, a.y * k);
   const len = (a) => Math.hypot(a.x, a.y);
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const vlerp = (a, b, t) => V(lerp(a.x, b.x, t), lerp(a.y, b.y, t));
   const norm = (a) => {
     const l = len(a);
     return l > 1e-6 ? V(a.x / l, a.y / l) : V(0, 0);
@@ -36,6 +38,8 @@
     return r;
   };
   const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2);
+  const easeOutBack = (t) => 1 + 2.7 * Math.pow(t - 1, 3) + 1.7 * Math.pow(t - 1, 2);
+  const damp = (rate, dt) => 1 - Math.exp(-rate * dt);
 
   function fnv(s) {
     let h = 0x811c9dc5;
@@ -63,7 +67,24 @@
 
   const pageUrl = () => location.href.split('#')[0];
   const squash = (s) => s.replace(/\s+/g, ' ').trim();
-  const stripRefs = (s) => squash(s.replace(/\[(?:\d+|[a-z]|citation needed|note \d+)\]/gi, ''));
+  // Reference marks ([13], [a], [citation needed]), and the halves of one a
+  // sentence break can leave at either end ("13] The families…").
+  const stripRefs = (s) =>
+    squash(s.replace(/\[(?:\d+|[a-z]|citation needed|note \d+)\]/gi, '').replace(/^\s*(?:\d+|[a-z])\]\s*/i, '').replace(/\s*\[\d*$/, ''));
+
+  // ------------------------------------------------------------------ the search
+
+  let goal = '';
+  let terms = []; // lowercase words and phrases; the app adds synonyms when the model has them
+
+  function hits(text) {
+    if (!terms.length || !text) return 0;
+    const lt = text.toLowerCase();
+    let n = 0;
+    for (const t of terms) if (lt.includes(t)) n++;
+    return n;
+  }
+  const matchOf = (f) => hits(f.text) * 2 + (f.kind === 'doi' || f.kind === 'isbn' || f.kind === 'id' ? hits(f.context) : 0);
 
   // ------------------------------------------------------------------ reading
 
@@ -74,7 +95,7 @@
     '.navbox, .vertical-navbox, .sidebar, .mw-editsection, .toc, #toc, .mw-jump-link, .hatnote, .metadata, .noprint, .catlinks, ' +
     '[class*=cookie], [id*=cookie], [class*=consent], [class*=newsletter], [class*=advert], [class*=sponsor], [class*=promo], ' +
     '[id^=ad-], [class^=ad-], .ad, .ads, .share, [class*=social], .spiderpet-badge, #spiderpet-host';
-  const skipMemo = new WeakMap();
+  let skipMemo = new WeakMap();
   function skipped(el) {
     if (!el || el.nodeType !== 1) return false;
     let v = skipMemo.get(el);
@@ -85,12 +106,12 @@
     return v;
   }
 
+  // Native and cheap where the browser has it; screen-reader-only text is
+  // squeezed into a 1-pixel box, so tiny boxes do not count.
   function shown(el) {
-    if (!el || !el.getClientRects().length) return false;
-    const cs = getComputedStyle(el);
-    if (cs.visibility === 'hidden' || cs.display === 'none' || +cs.opacity === 0) return false;
+    if (!el) return false;
+    if (el.checkVisibility && !el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return false;
     const r = el.getBoundingClientRect();
-    // Screen-reader-only text is squeezed into a 1-pixel box.
     return r.width > 2 && r.height > 2;
   }
 
@@ -101,7 +122,7 @@
     let best = null;
     let most = 0;
     for (const c of cands) {
-      const n = (c.innerText || '').length;
+      const n = (c.textContent || '').length;
       if (n > most * 1.15) {
         most = n;
         best = c;
@@ -114,7 +135,7 @@
   function contextOf(node) {
     const el = node.nodeType === 1 ? node : node.parentElement;
     const box = el?.closest('cite, .citation, .csl-entry, li, p, td, dd, figcaption, blockquote') || el;
-    return squash(box?.innerText || box?.textContent || '').slice(0, 700);
+    return squash(box?.textContent || '').slice(0, 700);
   }
 
   function rangeShown(range) {
@@ -129,20 +150,20 @@
     const url = pageUrl();
     const root = mainRoot();
     const out = [];
-    const byId = new Map();
+    const seen = new Map();
     let order = 0;
     const put = (f) => {
       f.text = squash(f.text);
       if (!f.text) return null;
       f.id = 'f' + fnv(`${f.kind}|${f.label || ''}|${f.text}|${url}`);
-      const first = byId.get(f.id);
+      const first = seen.get(f.id);
       if (first) {
         // Cited twice: restyle both, harvest once.
         if (f.el || f.range) (first.more ||= []).push(f);
         return null;
       }
       f.order = order++;
-      byId.set(f.id, f);
+      seen.set(f.id, f);
       out.push(f);
       return f;
     };
@@ -161,8 +182,9 @@
 
     // Ids that are links (Wikipedia, most reference lists).
     for (const a of root.querySelectorAll('a[href]')) {
-      if (skipped(a) || !shown(a)) continue;
       const href = a.href;
+      if (!/doi\.org|ncbi\.nlm\.nih\.gov|arxiv\.org|BookSources|openlibrary\.org\/isbn/i.test(href)) continue;
+      if (skipped(a) || !shown(a)) continue;
       let m;
       let f = null;
       if ((m = href.match(/doi\.org\/(10\.\d{4,9}\/[^?#\s]+)/i))) {
@@ -198,7 +220,7 @@
       const t = n.nodeValue;
       if (t.length < 6 || !/\d/.test(t)) continue;
       const pe = n.parentElement;
-      if (!pe || skipped(pe) || pe.closest('a') && used.has(pe.closest('a'))) continue;
+      if (!pe || skipped(pe) || (pe.closest('a') && used.has(pe.closest('a')))) continue;
       for (const [kind, label, rx] of ID_RX) {
         rx.lastIndex = 0;
         let m;
@@ -228,7 +250,6 @@
       }
       if (!el && /book/.test(c.className)) el = c.querySelector('i');
       if (!el) {
-        // A quoted run inside plain text: find it as a range.
         const tw = document.createTreeWalker(c, NodeFilter.SHOW_TEXT);
         for (let n = tw.nextNode(); n; n = tw.nextNode()) {
           const m = n.nodeValue.match(/["“]([^"”]{10,250})["”]/);
@@ -248,17 +269,21 @@
     // Headings: the shape of the page.
     for (const h of document.querySelectorAll('h1, h2, h3')) {
       if (!(root.contains(h) || h.tagName === 'H1') || skipped(h) || !shown(h)) continue;
-      const text = (h.innerText || '').replace(/\[\s*edit[^\]]*\]/gi, '').trim();
+      const text = (h.textContent || '').replace(/\[\s*edit[^\]]*\]/gi, '').trim();
       if (text.length >= 3 && text.length <= 140) put({ kind: 'heading', text, el: h });
     }
 
-    // Key sentences: the one or two sentences that carry each paragraph.
+    // Key sentences: the one or two that carry each paragraph, and with a
+    // search, every sentence that matches it.
     const titleWords = new Set(document.title.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 3));
     const seg = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter(document.documentElement.lang || 'en', { granularity: 'sentence' }) : null;
     const sentences = [];
     let pIndex = 0;
-    for (const p of root.querySelectorAll('p')) {
-      if (skipped(p) || !shown(p) || p.closest('cite, .references, .reflist, table, blockquote')) continue;
+    for (const p of root.querySelectorAll(terms.length ? 'p, li, dd, td, blockquote' : 'p')) {
+      if (skipped(p) || p.closest('cite, .references, .reflist') || (!terms.length && p.closest('table, blockquote'))) continue;
+      if (terms.length && p.tagName !== 'P' && p.querySelector('p, li')) continue; // its children are read instead
+      const rawAll = p.textContent || '';
+      if (rawAll.trim().length < (terms.length ? 30 : 100) || !shown(p)) continue;
       const nodes = [];
       let raw = '';
       const tw = document.createTreeWalker(p, NodeFilter.SHOW_TEXT);
@@ -267,48 +292,50 @@
         nodes.push({ n, at: raw.length });
         raw += n.nodeValue;
       }
-      if (raw.trim().length < 100) continue;
       const parts = seg ? [...seg.segment(raw)].map((s) => ({ at: s.index, s: s.segment })) : splitSentences(raw);
       const cands = [];
       parts.forEach((part, i) => {
         const text = stripRefs(part.s);
         const lt = text.toLowerCase();
-        if (text.length < 40 || text.length > 420 || !/[.!?]["”')\]]*$/.test(text)) return;
+        const match = hits(text);
+        if (text.length < (match ? 20 : 40) || text.length > 420) return;
+        if (!match && !/[.!?]["”')\]]*$/.test(text)) return;
         let s = text.length >= 60 && text.length <= 260 ? 1 : 0.35;
         if (i === 0) s += 0.7;
-        let hits = 0;
-        for (const w of titleWords) if (lt.includes(w)) hits++;
-        s += Math.min(1.5, 0.5 * hits);
+        let th = 0;
+        for (const w of titleWords) if (lt.includes(w)) th++;
+        s += Math.min(1.5, 0.5 * th);
         if (/ (is|are|was|were) (a|an|the) /.test(lt)) s += 0.35;
         if (/\d/.test(text) && !/^\d/.test(text)) s += 0.3;
         if (/^(it|this|these|they|he|she|that|such)\b/.test(lt)) s -= 0.3;
         if (/(cookie|subscribe|sign in|log in|newsletter|javascript)/.test(lt)) s = -9;
-        const startAt = part.at + (part.s.length - part.s.trimStart().length);
+        if (match) s += 3 + match;
+        const startAt = part.at + part.s.match(/^\s*(?:(?:\d+|[a-z])\]\s*)?/i)[0].length; // after a stray "13]"
         const endAt = part.at + part.s.trimEnd().length;
-        cands.push({ text, s, startAt, endAt });
+        cands.push({ text, s, startAt, endAt, match });
       });
       cands.sort((a, b) => b.s - a.s);
       const keep = raw.length > 900 ? 3 : raw.length > 450 ? 2 : 1;
-      for (const c of cands.slice(0, keep)) {
-        if (c.s < 0.9) break;
+      cands.forEach((c, i) => {
+        if (!(c.match || (i < keep && c.s >= 0.9 && p.tagName === 'P'))) return;
         const range = rangeFor(nodes, c.startAt, c.endAt);
         if (range) sentences.push({ kind: 'sentence', text: c.text, range, el: p, key: c.s >= 2.2, score0: c.s + (pIndex < 3 ? 0.4 : 0) });
-      }
+      });
       pIndex++;
     }
     // Enough to read, not the whole book.
     sentences.sort((a, b) => b.score0 - a.score0);
-    const keepSentences = new Set(sentences.slice(0, 30));
-    for (const s of sentences) if (keepSentences.has(s)) put(s);
+    for (const s of sentences.slice(0, terms.length ? 80 : 30)) put(s);
 
     // Links people would follow: real words, real addresses, in the text.
     let links = 0;
-    for (const a of root.querySelectorAll('p a[href], li a[href], dd a[href]')) {
-      if (links >= 30) break;
-      if (used.has(a) || skipped(a) || a.closest('cite, .references, .reflist') || !shown(a)) continue;
-      const text = (a.innerText || '').trim();
+    for (const a of root.querySelectorAll('p a[href], li a[href], dd a[href], h2 a[href], h3 a[href]')) {
+      if (links >= (terms.length ? 60 : 30)) break;
+      if (used.has(a) || skipped(a) || a.closest('cite, .references, .reflist')) continue;
+      const text = (a.textContent || '').trim();
       if (!/^https?:/.test(a.href) || a.getAttribute('href').startsWith('#')) continue;
-      if (text.split(/\s+/).length < 2 && text.length < 10) continue;
+      if (text.split(/\s+/).length < 2 && text.length < 10 && !hits(text)) continue;
+      if (!shown(a)) continue;
       if (put({ kind: 'link', text, href: a.href, el: a })) links++;
     }
     return out;
@@ -322,7 +349,7 @@
     return out;
   }
 
-  // A DOM range for characters [a, b) of a paragraph built from text nodes.
+  // A DOM range for characters [a, b) of a block built from text nodes.
   function rangeFor(nodes, a, b) {
     let sn = null, so = 0, en = null, eo = 0;
     for (const { n, at } of nodes) {
@@ -350,9 +377,14 @@
 
   // Where a find is right now, in page coordinates (the page may have reflowed).
   function boxOf(f) {
-    const r = (f.node || f.el)?.isConnected && f.kind !== 'sentence' ? (f.node || f.el).getBoundingClientRect() : f.range?.getBoundingClientRect();
+    const el = f.node || f.el;
+    const r = el?.isConnected && f.kind !== 'sentence' ? el.getBoundingClientRect() : f.range?.getBoundingClientRect();
     if (!r || r.width < 1 || r.height < 1) return null;
     return { x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height };
+  }
+  function linesOf(f) {
+    const rs = f.kind === 'sentence' || !(f.node || f.el)?.isConnected ? f.range?.getClientRects() : (f.node || f.el).getClientRects();
+    return [...(rs || [])].filter((r) => r.width > 1).map((r) => ({ x: r.left + scrollX, y: r.top + scrollY, w: r.width, h: r.height }));
   }
 
   // ------------------------------------------------------------------ the spider
@@ -368,6 +400,7 @@
     constructor(scale) {
       this.pos = V(0, 0);
       this.vel = V(0, 0);
+      this.bob = V(0, 0);
       this.heading = Math.PI / 2;
       this.goal = null;
       this.maxSpeed = 0;
@@ -377,6 +410,7 @@
       this.still = 0;
       this.burstT = 0;
       this.bursting = true;
+      this.face = null;
       this.legs = [];
       this.configure(scale);
     }
@@ -396,12 +430,15 @@
           });
     }
     reachOf(l) { return l.seg[0] + l.seg[1] + l.seg[2]; }
+    forward() { return fromAngle(this.heading); }
+    drawPos() { return add(this.pos, this.bob); }
+    head() { return add(this.drawPos(), mul(this.forward(), this.bodyLen * 0.32)); }
+    rear() { return sub(this.drawPos(), mul(this.forward(), this.bodyLen * 0.5)); }
     hip(l) {
-      const f = fromAngle(this.heading);
-      return add(add(this.pos, mul(f, l.along)), mul(perp(f), l.side * this.bodyWid * 0.5));
+      const f = this.forward();
+      return add(add(this.drawPos(), mul(f, l.along)), mul(perp(f), l.side * this.bodyWid * 0.5));
     }
     restPoint(l, curl = 1) { return add(this.pos, mul(fromAngle(this.heading + l.side * l.angle), l.rest * curl)); }
-    head() { return add(this.pos, mul(fromAngle(this.heading), this.bodyLen * 0.5 + 3 * this.scale)); }
     speed() { return len(this.vel); }
     place(p, heading = this.heading) {
       this.pos = p;
@@ -448,6 +485,7 @@
         this.vel = mul(this.vel, Math.exp(-9 * dt));
       }
       this.pos = add(this.pos, mul(this.vel, dt));
+      this.bob = mul(this.bob, Math.exp(-14 * dt));
       const sp = this.speed();
       let want = this.heading;
       if (sp > 18 * s) want = Math.atan2(this.vel.y, this.vel.x);
@@ -473,7 +511,7 @@
       if (l.stepping) {
         l.t += dt / l.dur;
         const k = easeInOut(Math.min(1, l.t));
-        const base = V(lerp(l.from.x, l.to.x, k), lerp(l.from.y, l.to.y, k));
+        const base = vlerp(l.from, l.to, k);
         l.lift = Math.sin(Math.PI * Math.min(1, l.t));
         l.foot = add(base, mul(norm(sub(base, this.pos)), l.lift * 7 * s));
         if (l.t >= 1) {
@@ -481,6 +519,8 @@
           l.stepping = false;
           l.lift = 0;
           stepping--;
+          // Each planted foot gives the body a small push: the bob.
+          this.bob = add(this.bob, mul(norm(sub(l.to, this.pos)), 0.9 * s));
         }
         this.solve(l);
         return stepping;
@@ -515,14 +555,13 @@
       const pole = add(add(h, mul(fromAngle(this.heading + l.side * l.pole), this.reach * 0.6)), mul(norm(tt), tl * 0.25));
       j[0] = h;
       if (!l.init) {
-        j[1] = V(lerp(h.x, pole.x, 0.7), lerp(h.y, pole.y, 0.7));
-        j[2] = V(lerp(pole.x, target.x, 0.5), lerp(pole.y, target.y, 0.5));
+        j[1] = vlerp(h, pole, 0.7);
+        j[2] = vlerp(pole, target, 0.5);
         j[3] = target;
         l.init = true;
       }
-      j[1] = V(lerp(j[1].x, pole.x, 0.3), lerp(j[1].y, pole.y, 0.3));
-      const mid = V(lerp(pole.x, target.x, 0.6), lerp(pole.y, target.y, 0.6));
-      j[2] = V(lerp(j[2].x, mid.x, 0.15), lerp(j[2].y, mid.y, 0.15));
+      j[1] = vlerp(j[1], pole, 0.3);
+      j[2] = vlerp(j[2], vlerp(pole, target, 0.6), 0.15);
       if (tl >= this.reachOf(l)) {
         const n = norm(tt);
         j[1] = add(h, mul(n, l.seg[0]));
@@ -542,6 +581,20 @@
 
   // ------------------------------------------------------------------ persona
 
+  const ADJ = ['cardboard', 'soggy', 'quantum', 'velvet', 'feral', 'haunted', 'tiny', 'rusty', 'cosmic', 'sleepy', 'crunchy', 'polite', 'sneaky', 'lunar',
+    'plastic', 'gloomy', 'frantic', 'bashful', 'wobbly', 'neon', 'dusty', 'grumpy', 'paper', 'midnight', 'spicy', 'hollow', 'mossy', 'electric'];
+  const NOUN = ['priest', 'harmonica', 'pickle', 'librarian', 'toaster', 'comet', 'accountant', 'teapot', 'wizard', 'noodle', 'archivist', 'pigeon', 'cactus',
+    'goblin', 'lantern', 'bishop', 'raccoon', 'waffle', 'oracle', 'gremlin', 'cassette', 'monk', 'crouton', 'kettle', 'walrus', 'clerk', 'sock', 'banana'];
+  const name = (() => {
+    try {
+      const kept = sessionStorage.getItem('spiderpet-name');
+      if (kept) return kept;
+    } catch {}
+    const n = `${pick(ADJ)} ${pick(NOUN)}`;
+    try { sessionStorage.setItem('spiderpet-name', n); } catch {}
+    return n;
+  })();
+
   const short = (s, n) => (s.length <= n ? s : s.slice(0, n - 1) + '…');
   const say = {
     land: () => pick(['new habitat.', 'touching down.', 'host acquired.', 'tasting the surface…']),
@@ -552,8 +605,12 @@
     lifted: () => pick(['!! displaced', 'lifted. hostile?', 'put me down.']),
     landed: () => pick(['relocated.', 'recalibrating…', 'new coordinates.']),
     offline: () => 'no link to the hive. start SpiderPet.exe',
+    hunt: () => `hunting: ${short(goal.toLowerCase(), 40)}`,
+    tracking: () => pick([`tracking “${short(goal.toLowerCase(), 28)}”…`, 'following the scent…', 'nothing yet. deeper.']),
+    huntDone: (n) => (n ? `hunt over: ${n} found.` : `no trace of “${short(goal.toLowerCase(), 28)}” here.`),
     eat(f) {
       const t = short(f.text, 34);
+      if (terms.length && matchOf(f) > 0) return pick([`found: ${t}`, `prey: ${t}`, `got one: ${t}`]);
       switch (f.kind) {
         case 'doi': return pick([`doi: ${t}`, `signal doi: ${t}`]);
         case 'isbn': return pick([`isbn: ${t}`, `book spore: ${t}`]);
@@ -590,17 +647,12 @@
   shadow.innerHTML = `
     <style>
       canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; }
-      .bubble { position: fixed; max-width: 320px; padding: 6px 11px; border-radius: 12px; font: 500 13px/1.35 "Cascadia Mono", Consolas, ui-monospace, monospace;
-        background: rgba(12,14,28,.93); color: #F4F6FF; border: 1.5px solid #DA3CEC; box-shadow: 0 4px 18px rgba(0,0,0,.35);
-        transition: opacity .4s; opacity: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
-      .bubble.light { background: rgba(255,255,255,.96); color: #14151C; border-color: #C42AD8; }
       .grab { position: fixed; width: 44px; height: 44px; margin: -22px 0 0 -22px; border-radius: 50%; pointer-events: auto; cursor: grab; }
       .grab:active { cursor: grabbing; }
     </style>
-    <canvas></canvas><div class="bubble"></div><div class="grab" title="SpiderPet: drag me"></div>`;
+    <canvas></canvas><div class="grab" title="SpiderPet: drag me"></div>`;
   const canvas = shadow.querySelector('canvas');
   const ctx = canvas.getContext('2d');
-  const bubble = shadow.querySelector('.bubble');
   const grab = shadow.querySelector('.grab');
 
   let dark = false;
@@ -614,10 +666,14 @@
     const l = bgOf(document.body) ?? bgOf(document.documentElement) ?? (matchMedia('(prefers-color-scheme: dark)').matches ? 0.1 : 1);
     dark = l < 0.45;
     document.documentElement.toggleAttribute('data-spiderpet-dark', dark);
-    bubble.classList.toggle('light', !dark);
+    // The desktop SpiderPet palette, exactly.
     pal = dark
-      ? { leg: '#EE7A68', joint: '#8BF5A6', body: '#6173F2', fill: 'rgba(10,12,26,.92)', head: '#E33CD2', tether: '#DA3CEC', silk: 'rgba(232,238,255,.25)', read: 'rgba(230,76,242,.22)' }
-      : { leg: '#E0604C', joint: '#22C463', body: '#4152E0', fill: 'rgba(16,18,42,.9)', head: '#D02CC0', tether: '#C42AD8', silk: 'rgba(20,24,40,.22)', read: 'rgba(196,42,216,.16)' };
+      ? { leg: '#EE7A68', joint: '#8BF5A6', body: '#6173F2', fill: 'rgba(10,12,26,.92)', head: '#E33CD2', tether: '#DA3CEC', name: '#F4F6FF',
+          nameStroke: 'rgba(0,0,0,.72)', silk: 'rgba(232,238,255,.17)', silkStrong: 'rgba(232,238,255,.31)', cloud: 'rgba(12,14,28,.93)',
+          magenta: '#E64CF2', green: '#93F5AE', blue: '#7D8BFF', salmon: '#F2836B', cyan: '#7FD6FF' }
+      : { leg: '#E0604C', joint: '#22C463', body: '#4152E0', fill: 'rgba(16,18,42,.9)', head: '#D02CC0', tether: '#C42AD8', name: '#14151C',
+          nameStroke: 'rgba(255,255,255,.85)', silk: 'rgba(20,24,40,.16)', silkStrong: 'rgba(20,24,40,.29)', cloud: 'rgba(255,255,255,.96)',
+          magenta: '#B414C8', green: '#0E9A4C', blue: '#3346E0', salmon: '#F2836B', cyan: '#0B7FB8' };
   }
 
   let dpr = 1;
@@ -627,51 +683,248 @@
     canvas.height = Math.round(innerHeight * dpr);
   }
 
-  function draw(t) {
+  function curve(a, c, b, upto = 1) {
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    const steps = Math.max(1, Math.round(14 * clamp(upto, 0, 1)));
+    for (let i = 1; i <= steps; i++) {
+      const t = i / 14;
+      const u = 1 - t;
+      ctx.lineTo(a.x * u * u + c.x * 2 * u * t + b.x * t * t, a.y * u * u + c.y * 2 * u * t + b.y * t * t);
+    }
+    ctx.stroke();
+  }
+
+  function dot(p, r, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Where the thought cloud and the name sit (page coordinates), easing along.
+  const label = { name: null, bubble: null, goal: null };
+  let thought = '';
+  let thoughtAt = -100;
+  function think(text) {
+    if (!text || text === thought) return;
+    thought = text;
+    thoughtAt = now();
+  }
+
+  function wrapText(text, maxW) {
+    const words = text.split(' ');
+    const lines = [];
+    let cur = '';
+    for (const w of words) {
+      const next = cur ? cur + ' ' + w : w;
+      if (ctx.measureText(next).width > maxW && cur) {
+        lines.push(cur);
+        cur = w;
+      } else cur = next;
+    }
+    if (cur) lines.push(cur);
+    return lines;
+  }
+
+  // A comic thought cloud: a rounded box with bumps on every side. Stroking
+  // every part thick, then filling every part, leaves only the outer outline.
+  function cloudParts(w, h, k) {
+    const parts = [];
+    const r = Math.min(h * 0.5, 14 * k);
+    parts.push({ rr: [0, 0, w, h, r] });
+    const rb = clamp(h * 0.34, 7 * k, 13 * k);
+    const n = Math.max(2, Math.floor((w - rb) / (rb * 1.5)));
+    for (let i = 0; i < n; i++) {
+      const x = rb * 0.9 + ((w - rb * 1.8) * i) / (n - 1);
+      parts.push({ c: [x, rb * 0.3, rb * (i % 2 ? 0.9 : 1)] });
+      parts.push({ c: [Math.min(w - rb * 0.6, x + rb * 0.4), h - rb * 0.3, rb * (i % 2 ? 1 : 0.85)] });
+    }
+    parts.push({ c: [rb * 0.25, h * 0.5, h * 0.42] });
+    parts.push({ c: [w - rb * 0.25, h * 0.5, h * 0.42] });
+    return parts;
+  }
+  function tracePart(p) {
+    ctx.beginPath();
+    if (p.rr) ctx.roundRect(...p.rr);
+    else ctx.arc(p.c[0], p.c[1], p.c[2], 0, Math.PI * 2);
+  }
+
+  function drawLabels(t, dt) {
+    const s = spider;
+    const k = s.scale;
+    const vx = scrollX, vy = scrollY, vw = innerWidth, vh = innerHeight;
+    const head = s.head();
+    const age = t - thoughtAt;
+
+    // The name floats over the spider when it has nothing to say.
+    ctx.font = `bold ${15 * k}px "Segoe UI", system-ui, sans-serif`;
+    const nw = ctx.measureText(name).width;
+    const body = s.drawPos();
+    let want = V(clamp(body.x, vx + nw / 2 + 6, vx + vw - nw / 2 - 6), clamp(body.y - s.reach * 0.95, vy + 20 * k, vy + vh - 4));
+    if (!label.name || dist(label.name, want) > 600) label.name = want;
+    label.name = vlerp(label.name, want, damp(5, dt));
+    if (!thought) {
+      ctx.textAlign = 'center';
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = 3.2;
+      ctx.strokeStyle = pal.nameStroke;
+      ctx.strokeText(name, label.name.x, label.name.y);
+      ctx.fillStyle = pal.name;
+      ctx.fillText(name, label.name.x, label.name.y);
+      ctx.textAlign = 'left';
+      return;
+    }
+
+    // The thought cloud: sized for the whole thought, typed out quickly.
+    const padx = 13 * k, pady = 9 * k, edge = 12 * k;
+    ctx.font = `${15.5 * k}px "Segoe UI", system-ui, sans-serif`;
+    const lines = wrapText(thought, 260 * k);
+    const lh = 15.5 * k * 1.3;
+    let tw = 0;
+    for (const l of lines) tw = Math.max(tw, ctx.measureText(l).width);
+    ctx.font = `bold ${12 * k}px "Segoe UI", system-ui, sans-serif`;
+    tw = Math.max(tw, ctx.measureText(name).width);
+    const nh = 12 * k * 1.3;
+    const w = tw + padx * 2;
+    const h = nh + k + lines.length * lh + pady * 2;
+    const fit = (q) => V(clamp(q.x, vx + w / 2 + edge, vx + vw - w / 2 - edge), clamp(q.y, vy + h + edge, vy + vh - edge));
+    // Well clear of the legs and never over the words the spider is working
+    // on: up-right first, then up-left, down-right, down-left. It holds still
+    // while the spider works nearby and only drifts over when it moved far.
+    const tb = tether ? boxOf(tether.f) : null;
+    const covers = (q) => tb && q.x - w / 2 < tb.x + tb.w && q.x + w / 2 > tb.x && q.y - h < tb.y + tb.h && q.y > tb.y;
+    const dx = s.reach * 1.1, up = head.y - s.reach * 1.35, down = head.y + s.reach * 1.35 + h;
+    const cands = [V(head.x + dx, up), V(head.x - dx, up), V(head.x + dx, down), V(head.x - dx, down)].map(fit);
+    const spot = cands.find((q) => !covers(q)) || cands[0];
+    // After a jump down the page it reappears next to the spider, not trailing in from off screen.
+    const lost = !label.bubble || label.bubble.y < vy + h * 0.5 || label.bubble.y - h > vy + vh - h * 0.5;
+    if (lost || dist(spot, label.bubble) > 1600) label.bubble = label.goal = spot;
+    if (dist(spot, label.goal) > s.reach * 1.6 || covers(label.goal)) label.goal = spot;
+    label.bubble = vlerp(label.bubble, fit(label.goal), damp(2.2, dt));
+    const tl = V(label.bubble.x - w / 2, label.bubble.y - h);
+
+    // Thought trail: three shrinking bubbles leading off toward the spider.
+    const below = label.bubble.y >= head.y;
+    const from = V(clamp(head.x, tl.x + 18 * k, tl.x + w - 18 * k), below ? tl.y - 5 * k : tl.y + h + 5 * k);
+    const to = add(head, V(0, below ? 10 * k : -10 * k));
+    const dir = norm(sub(to, from));
+    const reach = Math.min(dist(from, to), 70 * k);
+    [[4.8, 0.15], [3.4, 0.5], [2.2, 0.85]].forEach(([r, at]) => {
+      const c = add(from, mul(dir, reach * at));
+      dot(c, (r + 1.4) * k, pal.body);
+      dot(c, r * k, pal.cloud);
+    });
+
+    // A small pop when a new thought arrives.
+    const pop = 0.82 + 0.18 * easeOutBack(Math.min(1, age / 0.22));
+    ctx.save();
+    ctx.translate(tl.x + w / 2, tl.y + h);
+    ctx.scale(pop, pop);
+    ctx.translate(-w / 2, -h);
+    const parts = cloudParts(w, h, k);
+    ctx.strokeStyle = pal.body;
+    ctx.lineWidth = 3.2 * k;
+    for (const p of parts) {
+      tracePart(p);
+      ctx.stroke();
+    }
+    ctx.fillStyle = pal.cloud;
+    for (const p of parts) {
+      tracePart(p);
+      ctx.fill();
+    }
+    ctx.textBaseline = 'top';
+    ctx.font = `bold ${12 * k}px "Segoe UI", system-ui, sans-serif`;
+    ctx.fillStyle = dark ? pal.joint : pal.body;
+    ctx.fillText(name, padx, pady);
+    ctx.font = `${15.5 * k}px "Segoe UI", system-ui, sans-serif`;
+    ctx.fillStyle = pal.name;
+    let left = Math.floor(age * 55) + 1;
+    lines.forEach((l, i) => {
+      if (left <= 0) return;
+      ctx.fillText(l.slice(0, left), padx, pady + nh + k + i * lh);
+      left -= l.length + 1;
+    });
+    ctx.textBaseline = 'alphabetic';
+    ctx.restore();
+  }
+
+  function draw(t, dt) {
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, innerWidth, innerHeight);
     ctx.translate(-scrollX, -scrollY);
     const s = spider;
     const k = s.scale;
-    // Silk thread while it rappels or hangs from your hand.
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    // Silk between finds, and the dragline back to the last one.
+    ctx.lineWidth = 0.9;
+    ctx.strokeStyle = pal.silk;
+    for (const w of silk) {
+      const a = anchorOf(w.a), b = anchorOf(w.b);
+      if (!a || !b) continue;
+      if ((a.y < scrollY - 400 && b.y < scrollY - 400) || (a.y > scrollY + innerHeight + 400 && b.y > scrollY + innerHeight + 400)) continue;
+      const d = dist(a, b);
+      curve(a, add(vlerp(a, b, 0.5), V(0, d * 0.08)), b, (t - w.at) / 0.35);
+    }
+    const last = lastEaten && anchorOf(lastEaten);
+    if (last && mode !== 'held' && mode !== 'drop') {
+      const rear = s.rear();
+      const d = dist(rear, last);
+      ctx.strokeStyle = pal.silkStrong;
+      curve(rear, add(vlerp(rear, last, 0.5), V(0, d * 0.1)), last);
+    }
+
+    // The thread it rappels on, or hangs from your hand by.
     if (mode === 'drop' || mode === 'held') {
-      ctx.strokeStyle = pal.silk;
-      ctx.lineWidth = 1;
+      ctx.strokeStyle = pal.name;
+      ctx.globalAlpha = 0.6;
+      ctx.lineWidth = 1.1;
       ctx.beginPath();
-      ctx.moveTo(s.pos.x, mode === 'drop' ? scrollY : s.pos.y - 300 * k);
-      ctx.lineTo(s.pos.x, s.pos.y);
+      ctx.moveTo(s.rear().x, mode === 'drop' ? scrollY - 4 : s.rear().y - 300 * k);
+      ctx.lineTo(s.rear().x, s.rear().y);
       ctx.stroke();
+      ctx.globalAlpha = 1;
     }
-    // Sentences being read, when the page cannot highlight them itself.
+
+    // Sentences read so far, when the page cannot highlight them itself.
     if (!HIGHLIGHTS && readingRange) {
-      ctx.fillStyle = pal.read;
-      for (const r of readingRange.getClientRects()) ctx.fillRect(r.left + scrollX, r.top + scrollY, r.width, r.height);
+      ctx.fillStyle = dark ? 'rgba(230,76,242,.18)' : 'rgba(180,20,200,.14)';
+      for (const r of readingRange.getClientRects()) ctx.fillRect(r.left + scrollX - 1, r.top + scrollY - 1, r.width + 2, r.height + 2);
     }
-    // The lasso.
-    if (tether && tether.amount > 0) {
-      const b = boxOf(tether.f);
-      if (b) {
-        const from = s.head();
-        const to = V(clamp(from.x, b.x, b.x + b.w), clamp(from.y, b.y, b.y + b.h));
-        const end = V(lerp(from.x, to.x, tether.amount), lerp(from.y, to.y, tether.amount));
+
+    // Lock-on: the box pulses around the target and the line is out from the
+    // head. A grab shoots it; a read runs its tip along the sentence.
+    if (tether) {
+      const head = s.head();
+      if (tether.mode !== 'read') {
+        const pulse = 0.75 + 0.25 * Math.sin(t * 9);
         ctx.strokeStyle = pal.tether;
-        ctx.lineWidth = Math.max(1.2, 1.6 * k);
-        ctx.setLineDash(tether.amount >= 1 ? [] : [5 * k, 4 * k]);
+        ctx.globalAlpha = pulse;
+        ctx.lineWidth = 1.6;
+        for (const r of linesOf(tether.f).slice(0, 4)) ctx.strokeRect(r.x - 2.5, r.y - 2.5, r.w + 5, r.h + 5);
+        ctx.globalAlpha = 1;
+      }
+      let end = tether.tip;
+      if (!end) {
+        const b = boxOf(tether.f);
+        if (b) end = V(clamp(head.x, b.x - 2.5, b.x + b.w + 2.5), clamp(head.y, b.y - 2.5, b.y + b.h + 2.5));
+      }
+      if (end) {
+        const tip = vlerp(head, end, tether.amount);
+        ctx.strokeStyle = pal.tether;
+        ctx.lineWidth = Math.max(1.2, 1.7 * k);
         ctx.beginPath();
-        ctx.moveTo(from.x, from.y);
-        ctx.lineTo(end.x, end.y);
+        ctx.moveTo(head.x, head.y);
+        ctx.lineTo(tip.x, tip.y);
         ctx.stroke();
-        ctx.setLineDash([]);
-        if (tether.amount >= 1) {
-          const pulse = 0.55 + 0.45 * Math.sin(t * 9);
-          ctx.globalAlpha = pulse;
-          ctx.strokeRect(b.x - 3, b.y - 2, b.w + 6, b.h + 4);
-          ctx.globalAlpha = 1;
-        }
+        dot(tip, Math.max(1.6, 2.4 * k), pal.tether);
       }
     }
+
     // Legs, joints, body, head: the node-and-line look of the reference clip.
-    ctx.lineCap = 'round';
     ctx.strokeStyle = pal.leg;
     ctx.lineWidth = Math.max(1.1, 1.9 * k);
     ctx.beginPath();
@@ -682,14 +935,17 @@
     ctx.stroke();
     const r = Math.max(1.8, 3.1 * k);
     ctx.fillStyle = pal.joint;
+    ctx.beginPath();
     for (const l of s.legs)
       for (let i = 1; i < 4; i++) {
-        ctx.beginPath();
-        ctx.arc(l.j[i].x, l.j[i].y, i === 3 ? r * (1 + 0.35 * l.lift) : r, 0, Math.PI * 2);
-        ctx.fill();
+        const rr = i === 3 ? r * (1 + 0.35 * l.lift) : r;
+        ctx.moveTo(l.j[i].x + rr, l.j[i].y);
+        ctx.arc(l.j[i].x, l.j[i].y, rr, 0, Math.PI * 2);
       }
+    ctx.fill();
+    const c = s.drawPos();
     ctx.save();
-    ctx.translate(s.pos.x, s.pos.y);
+    ctx.translate(c.x, c.y);
     ctx.rotate(s.heading);
     ctx.fillStyle = pal.fill;
     ctx.strokeStyle = pal.body;
@@ -697,39 +953,63 @@
     ctx.fillRect(-s.bodyLen / 2, -s.bodyWid / 2, s.bodyLen, s.bodyWid);
     ctx.strokeRect(-s.bodyLen / 2, -s.bodyWid / 2, s.bodyLen, s.bodyWid);
     ctx.restore();
-    const hd = s.head();
-    ctx.fillStyle = pal.head;
-    ctx.beginPath();
-    ctx.arc(hd.x, hd.y, Math.max(2.2, 3.7 * k), 0, Math.PI * 2);
-    ctx.fill();
+    dot(s.head(), Math.max(2.2, 3.7 * k), pal.head);
 
-    // The thought bubble rides above the spider.
-    const bx = clamp(s.pos.x - scrollX - 20, 8, innerWidth - 340);
-    const by = clamp(s.pos.y - scrollY - s.reach * 0.9 - 30, 8, innerHeight - 40);
-    bubble.style.left = bx + 'px';
-    bubble.style.top = by + 'px';
-    bubble.style.opacity = t - thoughtAt < 3.6 ? '1' : '0';
+    drawLabels(t, dt);
+
+    // Arrival glitch: torn color bars down the left edge for a moment.
+    const intro = t - summonedAt;
+    if (intro >= 0 && intro < 0.7) {
+      const a = 1 - intro / 0.7;
+      const bars = [pal.magenta, pal.green, pal.blue, pal.salmon, pal.cyan];
+      ctx.globalAlpha = 0.5 * a;
+      for (let i = 0; i < 18; i++) {
+        ctx.fillStyle = pick(bars);
+        ctx.fillRect(scrollX + rand(0, 30), scrollY + rand(0, innerHeight), rand(10, 160), rand(2, 6));
+      }
+      ctx.globalAlpha = 1;
+    }
+
     grab.style.left = s.pos.x - scrollX + 'px';
     grab.style.top = s.pos.y - scrollY + 'px';
-  }
-
-  let thoughtAt = -100;
-  function think(text) {
-    if (!text) return;
-    bubble.textContent = text;
-    thoughtAt = now();
   }
 
   // ------------------------------------------------------------------ the page's look
 
   const HIGHLIGHTS = typeof CSS !== 'undefined' && CSS.highlights && typeof Highlight === 'function';
-  const eatenSentences = HIGHLIGHTS ? new Highlight() : null;
-  const readingHighlight = HIGHLIGHTS ? new Highlight() : null;
-  if (HIGHLIGHTS) {
-    CSS.highlights.set('spiderpet-eaten', eatenSentences);
-    CSS.highlights.set('spiderpet-reading', readingHighlight);
-  }
+  const hl = {};
+  if (HIGHLIGHTS)
+    for (const n of ['eaten', 'eaten-key', 'reading', 'reading-key', 'goal']) {
+      hl[n] = new Highlight();
+      CSS.highlights.set('spiderpet-' + n, hl[n]);
+    }
   let readingRange = null;
+
+  // Every place the search words appear, lit up at once.
+  function lightGoal() {
+    if (!HIGHLIGHTS) return;
+    hl.goal.clear();
+    if (!terms.length) return;
+    const root = mainRoot();
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let count = 0;
+    for (let n = tw.nextNode(); n && count < 600; n = tw.nextNode()) {
+      const t = n.nodeValue;
+      if (t.length < 2 || skipped(n.parentElement)) continue;
+      const lt = t.toLowerCase();
+      for (const term of terms) {
+        let at = lt.indexOf(term);
+        while (at >= 0 && count < 600) {
+          const r = document.createRange();
+          r.setStart(n, at);
+          r.setEnd(n, at + term.length);
+          hl.goal.add(r);
+          count++;
+          at = lt.indexOf(term, at + term.length);
+        }
+      }
+    }
+  }
 
   function glitch(node) {
     if (!node) return;
@@ -741,15 +1021,14 @@
 
   // Restyle the real text, the way the clip does: no overlay, the page itself changes.
   function restyle(f) {
-    const all = [f, ...(f.more || [])];
-    for (const x of all) {
+    for (const x of [f, ...(f.more || [])]) {
       if (x.styled) {
         glitch(x.node);
         continue;
       }
       x.styled = true;
       if (x.kind === 'sentence') {
-        if (HIGHLIGHTS) eatenSentences.add(x.range);
+        if (HIGHLIGHTS) hl[x.key ? 'eaten-key' : 'eaten'].add(x.range);
         x.node = null;
         continue;
       }
@@ -764,10 +1043,11 @@
         }
       }
       if (!node) continue;
-      node.classList.add('spiderpet-on', 'spiderpet-' + x.kind);
+      node.classList.add('spiderpet-on', 'spiderpet-' + x.kind, 'spiderpet-v' + (parseInt(x.id.slice(1), 36) % 3));
       x.node = node;
       glitch(node);
     }
+    ownChanges();
   }
 
   const BADGE = {
@@ -814,6 +1094,7 @@
     const src = v.source?.name ? `\nsource: ${v.source.name}${v.source.title ? ' — ' + v.source.title : ''}` : '';
     const quote = v.quote ? `\n“${v.quote}”` : '';
     f.badge.title = `${v.note || ''}${quote}${src}${v.source?.url ? '\n(click to open the source)' : ''}`;
+    ownChanges();
   }
 
   // ------------------------------------------------------------------ behaviour
@@ -822,34 +1103,66 @@
   const byId = new Map();
   let app = { connected: false, settings: {} };
   let spider = null;
-  let mode = 'drop'; // drop, walk, lasso, eat, rest, held, crawl
+  let mode = 'drop'; // drop, walk, lasso, eat, rest, held
   let target = null;
   let tether = null;
   let modeAt = 0;
   let userScrolledAt = -100;
   let ourScrollAt = -100;
   let lastScanAt = 0;
+  let chooseAt = 0;
+  let domDirty = true;
   let running = false;
   let raf = 0;
   let lastT = now();
   let revealId = null;
   let lastUrl = pageUrl();
   let restingSaid = false;
+  let summonedAt = -100;
+  let silk = []; // {a, b, at}: threads between finds eaten one after another
+  let lastEaten = null;
+  let found = 0; // matches eaten in this hunt
+
+  // The page changed (lazy loading, infinite feeds): read it again later.
+  // Reading a big page can take half a second, so the slower the last read,
+  // the longer the wait before the next one.
+  let scanGap = 3;
+  let scanMs = 0;
+  const observer = new MutationObserver(() => {
+    domDirty = true;
+  });
+  // The spider's own changes (restyled words, badges) are not news.
+  const ownChanges = () => observer.takeRecords();
+
+  // Where a silk thread ends. Measuring forces the browser to lay the page
+  // out, so each spot is measured twice a second, not every frame.
+  const anchors = new Map(); // id -> { p, at }
+  function anchorOf(id) {
+    const t = now();
+    const c = anchors.get(id);
+    if (c && t - c.at < 0.5) return c.p;
+    const f = byId.get(id);
+    const ls = f ? linesOf(f) : [];
+    const p = ls.length ? V(ls[0].x, ls[0].y + ls[0].h / 2) : null;
+    anchors.set(id, { p, at: t + Math.random() * 0.2 }); // spread the re-measuring over frames
+    return p;
+  }
 
   function setMode(m) {
     mode = m;
     modeAt = now();
   }
 
-  function view() {
-    return { x: scrollX, y: scrollY, w: innerWidth, h: innerHeight };
-  }
-
   function rescan(sendAll) {
+    const t0 = now();
+    domDirty = false;
+    skipMemo = new WeakMap();
+    const got = scan();
     lastScanAt = now();
-    const found = scan();
+    scanMs = (lastScanAt - t0) * 1000;
+    scanGap = clamp((lastScanAt - t0) * 40, 3, 30);
     const fresh = [];
-    for (const f of found) {
+    for (const f of got) {
       const old = byId.get(f.id);
       if (old) {
         // Same find, maybe a new place in a re-rendered page.
@@ -869,8 +1182,9 @@
     if (list.length)
       api.runtime.sendMessage({
         type: 'finds', url: pageUrl(), title: document.title, lang: document.documentElement.lang || '',
-        finds: list.map(({ id, kind, text, label, href, context, page, key, order }) => ({ id, kind, text, label: label || '', href: href || '', context: context || '', page: !!page, key: !!key, order })),
+        finds: list.map(({ id, kind, text, label, href, context, page, key, order }) => ({ id, kind, text, label: label || '', href: href || '', context: context || '', page: !!page, key: !!key, order, match: hits(text) })),
       }).catch(() => {});
+    if (terms.length) lightGoal();
     return fresh.length;
   }
 
@@ -880,21 +1194,25 @@
     api.runtime.sendMessage({ type: 'page', url: pageUrl(), title: document.title, lang: document.documentElement.lang || '', text }).catch(() => {});
   }
 
-  // What next: the most valuable find near the spider, in view, in reading order.
+  // What next: the most valuable find near the spider, in view, in reading
+  // order. On a hunt, only what matches the search (or what the AI rated high).
   function chooseTarget() {
-    const v = view();
+    const vy = scrollY, vh = innerHeight, vx = scrollX, vw = innerWidth;
     let best = null;
     let bestScore = -1e9;
     for (const f of finds) {
       if (f.eaten || f.page) continue;
+      const m = terms.length ? matchOf(f) : 0;
+      if (terms.length && m === 0 && !(f.score >= 7)) continue;
       const b = boxOf(f);
       if (!b) continue;
-      if (b.y + b.h < v.y + 4 || b.y > v.y + v.h - 20 || b.x > v.x + v.w || b.x + b.w < v.x) continue;
+      if (b.y + b.h < vy + 4 || b.y > vy + vh - 20 || b.x > vx + vw || b.x + b.w < vx) continue;
       let s = KIND_PRIO[f.kind] ?? 1;
       if (f.key) s += 0.8;
-      if (f.score >= 0) s += f.score * 0.35 - 1.2; // the app knows what you are after
+      if (f.score >= 0) s += f.score * 0.35 - 1.2; // the AI knows what you are after
+      s += m * 2.5;
       s -= dist(spider.pos, V(b.x, b.y + b.h / 2)) / (900 * spider.scale);
-      s -= (b.y - v.y) / 2400;
+      s -= (b.y - vy) / 2400;
       if (s > bestScore) {
         bestScore = s;
         best = f;
@@ -914,8 +1232,31 @@
     return V(clamp(x, scrollX + 20, scrollX + innerWidth - 20), clamp(y, scrollY + 20, scrollY + innerHeight - 20));
   }
 
+  // The next match the spider has not eaten: below the view first, in reading order.
+  function nextMatch() {
+    const below = scrollY + innerHeight - 20;
+    let down = null, up = null;
+    for (const f of finds) {
+      if (f.eaten || f.page || !(matchOf(f) > 0 || f.score >= 7)) continue;
+      const b = boxOf(f);
+      if (!b) continue;
+      if (b.y > below) {
+        if (!down || b.y < down.b.y) down = { f, b };
+      } else if (b.y + b.h < scrollY + 4) {
+        if (!up || b.y < up.b.y) up = { f, b };
+      }
+    }
+    return down || up;
+  }
+
   function atBottom() {
     return scrollY + innerHeight >= document.documentElement.scrollHeight - 8;
+  }
+
+  function crawlOn(t, k) {
+    ourScrollAt = t;
+    window.scrollBy({ top: innerHeight * (terms.length ? 0.8 : 0.7), behavior: 'smooth' });
+    spider.setGoal(V(spider.pos.x, scrollY + innerHeight * 0.75), 260 * k, 80 * k);
   }
 
   function step(t, dt) {
@@ -944,12 +1285,15 @@
     }
     switch (mode) {
       case 'drop': {
+        // It lands a third of the way down the view, wherever the view is now
+        // (the page may still be scrolling).
         spider.airborne = true;
-        spider.pos = V(spider.pos.x, Math.min(spider.goal.y, spider.pos.y + 900 * k * dt));
-        if (spider.pos.y >= spider.goal.y - 1) {
+        const landY = scrollY + clamp(innerHeight * 0.3, 160, 360);
+        spider.pos = V(spider.pos.x, Math.min(landY, Math.max(spider.pos.y, scrollY - 40) + 900 * k * dt));
+        if (spider.pos.y >= landY - 1) {
           spider.airborne = false;
           spider.place(spider.pos, Math.PI / 2);
-          think(app.connected ? say.land() : say.offline());
+          think(!app.connected ? say.offline() : terms.length ? say.hunt() : say.land());
           setMode('walk');
           target = null;
         }
@@ -972,38 +1316,51 @@
           }
         }
         if (!target || target.eaten) {
+          target = null;
+          if (t - chooseAt < 0.25) break; // looking costs layout: four times a second is plenty
+          chooseAt = t;
           target = chooseTarget();
           if (!target) {
-            // Out of food in view: look again (lazy pages), then crawl down.
-            if (t - lastScanAt > 2 && rescan(false)) break;
-            const crawl = app.settings?.crawl !== false;
-            if (crawl && !atBottom() && t - userScrolledAt > 4 && t - ourScrollAt > 1.2) {
-              think(say.crawl());
-              ourScrollAt = t;
-              window.scrollBy({ top: innerHeight * 0.7, behavior: 'smooth' });
-              spider.setGoal(V(spider.pos.x, scrollY + innerHeight * 0.75), 260 * k, 80 * k);
+            // Out of food in view: look again if the page changed (lazy pages), then crawl down.
+            if (domDirty && t - lastScanAt > scanGap && rescan(false)) break;
+            // On a hunt it jumps straight to the next match and drops in on a thread.
+            if (terms.length && t - ourScrollAt > 0.9) {
+              const next = nextMatch();
+              if (next) {
+                ourScrollAt = t;
+                think(say.tracking());
+                window.scrollTo({ top: Math.max(0, next.b.y - innerHeight * 0.35), behavior: 'smooth' });
+                break;
+              }
+            }
+            const crawl = app.settings?.crawl !== false || terms.length;
+            if (crawl && !atBottom() && t - userScrolledAt > (terms.length ? 2 : 4) && t - ourScrollAt > (terms.length ? 0.9 : 1.2)) {
+              think(terms.length ? say.tracking() : say.crawl());
+              crawlOn(t, k);
             } else if (t - ourScrollAt > 1.5 && !restingSaid) {
               restingSaid = true;
-              think(atBottom() ? say.drained() : say.more());
+              think(terms.length && atBottom() ? say.huntDone(found) : atBottom() ? say.drained() : say.more());
               setMode('rest');
             }
             break;
           }
           restingSaid = false;
-          if (Math.random() < 0.25) think(say.sense());
+          tether = { f: target, amount: 1, mode: 'travel' }; // locked on while it walks over, like the clip
+          if (!terms.length && Math.random() < 0.25) think(say.sense());
         }
-        const goal = approachPoint(target);
-        if (!goal) {
+        const goalPt = approachPoint(target);
+        if (!goalPt) {
           target.eaten = true; // it vanished from the page
           target = null;
+          tether = null;
           break;
         }
-        spider.setGoal(goal, 560 * k, 70 * k);
+        spider.setGoal(goalPt, (terms.length ? 680 : 560) * k, 70 * k);
         const b = boxOf(target);
         const near = V(clamp(spider.pos.x, b.x, b.x + b.w), clamp(spider.pos.y, b.y, b.y + b.h));
-        if (dist(spider.pos, near) < spider.reach * 1.05 || (dist(spider.pos, goal) < 12 * k && spider.speed() < 40 * k)) {
+        if (dist(spider.pos, near) < spider.reach * 1.05 || (dist(spider.pos, goalPt) < 12 * k && spider.speed() < 40 * k)) {
           spider.face = Math.atan2(near.y - spider.pos.y, near.x - spider.pos.x);
-          tether = { f: target, amount: 0 };
+          tether = { f: target, amount: 0, mode: 'grab' };
           setMode('lasso');
         }
         break;
@@ -1014,9 +1371,13 @@
         if (tether.amount >= 1) {
           restyle(target);
           target.eaten = true;
+          if (terms.length && matchOf(target) > 0) found++;
           think(say.eat(target));
           api.runtime.sendMessage({ type: 'eaten', id: target.id }).catch(() => {});
           badge(target);
+          if (lastEaten && lastEaten !== target.id) silk.push({ a: lastEaten, b: target.id, at: t });
+          if (silk.length > 160) silk.shift();
+          lastEaten = target.id;
           if (target.kind === 'sentence') startReading(target);
           setMode('eat');
         }
@@ -1027,7 +1388,10 @@
         if (target.kind === 'sentence') readProgress(target, (t - modeAt) / hold);
         if (t - modeAt > hold) {
           readingRange = null;
-          if (HIGHLIGHTS) readingHighlight.clear();
+          if (HIGHLIGHTS) {
+            hl.reading.clear();
+            hl['reading-key'].clear();
+          }
           tether = null;
           spider.face = null;
           target = null;
@@ -1037,8 +1401,10 @@
       }
       case 'rest': {
         spider.setGoal(spider.pos, 0, 1);
+        if (t - chooseAt < 0.5) break;
+        chooseAt = t;
         // New things in view (you scrolled, the page grew): back to work.
-        if (t - modeAt > 1.5 && (chooseTarget() || (t - lastScanAt > 3 && rescan(false)))) {
+        if (t - modeAt > 1.5 && (chooseTarget() || (domDirty && t - lastScanAt > scanGap && rescan(false)))) {
           restingSaid = false;
           setMode('walk');
         } else if (t - modeAt > 6 && app.settings?.crawl !== false && !atBottom() && t - userScrolledAt > 4) {
@@ -1050,10 +1416,12 @@
     spider.tick(dt);
   }
 
-  // The sentence sweep: a highlight that grows as the spider reads.
+  // The sentence sweep: highlight and underline grow as the spider reads,
+  // and the lasso's tip runs along with it.
   function startReading(f) {
     readingRange = f.range.cloneRange();
     readingRange.collapse(true);
+    tether = { f, amount: 1, mode: 'read', tip: null };
   }
   function readProgress(f, p) {
     p = clamp(p, 0, 1);
@@ -1061,11 +1429,11 @@
     const r = document.createRange();
     try {
       r.setStart(full.startContainer, full.startOffset);
-      // Walk forward through the text nodes to the right point.
       const total = full.toString().length;
       let want = Math.round(total * p);
-      const tw = document.createTreeWalker(full.commonAncestorContainer.nodeType === 1 ? full.commonAncestorContainer : full.commonAncestorContainer.parentNode, NodeFilter.SHOW_TEXT);
-      let n = tw.currentNode = full.startContainer;
+      const rootNode = full.commonAncestorContainer.nodeType === 1 ? full.commonAncestorContainer : full.commonAncestorContainer.parentNode;
+      const tw = document.createTreeWalker(rootNode, NodeFilter.SHOW_TEXT);
+      let n = (tw.currentNode = full.startContainer);
       let off = full.startOffset;
       while (n) {
         const room = (n === full.endContainer ? full.endOffset : n.nodeValue.length) - off;
@@ -1085,24 +1453,30 @@
       return;
     }
     readingRange = r;
+    const rects = r.getClientRects();
+    const lr = rects[rects.length - 1];
+    if (lr && tether) tether.tip = V(lr.right + scrollX, lr.bottom + scrollY + 1);
     if (HIGHLIGHTS) {
-      readingHighlight.clear();
-      readingHighlight.add(r);
+      const h = hl[f.key ? 'reading-key' : 'reading'];
+      h.clear();
+      h.add(r);
     }
   }
 
   function frame() {
     if (!running) return;
+    raf = requestAnimationFrame(frame);
     const t = now();
+    const resting = mode === 'rest' && spider.speed() < 1 && t - thoughtAt > 2;
+    if (t - lastT < (resting ? 1 / 31 : 1 / 61)) return;
     const dt = Math.min(0.05, t - lastT);
     lastT = t;
     try {
       step(t, dt);
-      draw(t);
+      draw(t, dt);
     } catch (e) {
       console.warn('SpiderPet:', e);
     }
-    raf = requestAnimationFrame(frame);
   }
 
   // ------------------------------------------------------------------ input
@@ -1142,10 +1516,32 @@
 
   // ------------------------------------------------------------------ messages
 
+  function setGoal(g, list) {
+    const changed = g !== goal;
+    goal = g || '';
+    terms = goal ? [...new Set((list || []).map((x) => String(x).toLowerCase().trim()).filter((x) => x.length >= 2))] : [];
+    if (changed) {
+      found = 0;
+      restingSaid = false;
+      if (mode === 'walk' || mode === 'rest') {
+        target = null;
+        tether = null;
+        setMode('walk');
+      }
+      think(goal ? say.hunt() : say.sense());
+    }
+    rescan(false); // sentences that match the search join the hunt
+    lightGoal();
+  }
+
   function onMessage(m) {
     switch (m.type) {
       case 'app':
         app = m.app || app;
+        if (app.goal !== undefined && (app.goal !== goal || (app.terms || []).length !== terms.length)) setGoal(app.goal, app.terms);
+        break;
+      case 'goal':
+        setGoal(m.goal, m.terms);
         break;
       case 'verdict': {
         const f = byId.get(m.id);
@@ -1175,7 +1571,7 @@
         }
         break;
       case 'gist':
-        if (m.gist?.summary) think('habitat: ' + short(m.gist.summary.toLowerCase().replace(/\.$/, ''), 44));
+        if (m.gist?.summary && !terms.length) think('habitat: ' + short(m.gist.summary.toLowerCase().replace(/\.$/, ''), 44));
         break;
       case 'reveal':
         // Finish the bite in progress; the walk picks the request up next.
@@ -1194,45 +1590,62 @@
   function reset() {
     finds = [];
     byId.clear();
+    anchors.clear();
     target = null;
     tether = null;
     readingRange = null;
-    if (HIGHLIGHTS) {
-      eatenSentences.clear();
-      readingHighlight.clear();
-    }
+    silk = [];
+    lastEaten = null;
+    if (HIGHLIGHTS) for (const h of Object.values(hl)) h.clear();
     hello();
   }
 
   function hello() {
     readTheme();
     api.runtime.sendMessage({ type: 'spider-hello', url: pageUrl(), title: document.title }).then((r) => {
-      if (r?.app) app = r.app;
+      if (r?.app) {
+        app = r.app;
+        goal = app.goal || '';
+        terms = goal ? (app.terms || []).map((x) => String(x).toLowerCase()) : [];
+      }
       if (r?.reveal) revealId = r.reveal;
       sendPage();
       rescan(true);
+      if (terms.length) think(say.hunt());
     }).catch(() => {
       rescan(false);
     });
   }
 
+  // The old desktop spider's size: the body is about two lines of text long.
+  function scaleForPage() {
+    const root = mainRoot();
+    const p = root.querySelector('p') || root;
+    const cs = getComputedStyle(p);
+    let lh = parseFloat(cs.lineHeight);
+    if (!lh) lh = (parseFloat(cs.fontSize) || 16) * 1.4;
+    return clamp(lh / 22, 0.7, 1.7);
+  }
+
   function start() {
+    if (running) return;
     running = true;
     document.documentElement.appendChild(host);
     resize();
     readTheme();
-    const fs = parseFloat(getComputedStyle(mainRoot()).fontSize) || 16;
-    spider = new Spider(clamp(fs / 16, 0.85, 1.5) * 0.55);
+    spider = spider || new Spider(scaleForPage());
     const x = scrollX + clamp(innerWidth * 0.22, 120, 420);
+    spider.airborne = true;
     spider.place(V(x, scrollY - 40), Math.PI / 2);
     spider.goal = V(x, scrollY + clamp(innerHeight * 0.3, 160, 360));
-    spider.airborne = true;
+    summonedAt = now();
     setMode('drop');
     addEventListener('resize', resize);
     addEventListener('wheel', markUser, { passive: true });
     addEventListener('touchmove', markUser, { passive: true });
     addEventListener('keydown', onKey);
     api.runtime.onMessage.addListener(onMessage);
+    observer.observe(document.body, { childList: true, subtree: true });
     hello();
     lastT = now();
     raf = requestAnimationFrame(frame);
@@ -1243,12 +1656,17 @@
     running = false;
     cancelAnimationFrame(raf);
     host.remove();
+    observer.disconnect();
     removeEventListener('resize', resize);
     removeEventListener('wheel', markUser);
     removeEventListener('touchmove', markUser);
     removeEventListener('keydown', onKey);
     api.runtime.onMessage.removeListener(onMessage);
-    if (HIGHLIGHTS) readingHighlight.clear();
+    if (HIGHLIGHTS) {
+      hl.reading.clear();
+      hl['reading-key'].clear();
+      hl.goal.clear();
+    }
     api.runtime.sendMessage({ type: 'stopped' }).catch(() => {});
     // Restyled text and checks stay, so you can still read them.
   }
@@ -1258,6 +1676,8 @@
       if (!running) start();
     },
     running: () => running,
+    // For tests and bug reports: how hard the spider is working.
+    stats: () => ({ mode, finds: finds.length, eaten: finds.filter((f) => f.eaten).length, scanMs: Math.round(scanMs), scanGap, goal, terms }),
   };
   start();
 })();

@@ -26,10 +26,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
 #include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 
@@ -44,7 +46,7 @@ namespace {
 constexpr UINT kTrayMsg = WM_APP + 1;
 constexpr UINT kShowMsg = WM_APP + 2;
 constexpr UINT kWakeMsg = WM_APP + 3;
-constexpr const char* kVersion = "3.0.0";
+constexpr const char* kVersion = "3.1.0";
 
 ImVec4 hexv(uint32_t c, float a = 1.f) {
   return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
@@ -93,6 +95,44 @@ std::string jstr(const json& j, const char* k) {
 bool rankable(const json& f) {
   const std::string k = jstr(f, "kind");
   return k == "sentence" || k == "heading" || k == "link" || k == "title";
+}
+
+// Words that would match half of any page.
+bool stopword(const std::string& w) {
+  static const std::set<std::string> s = {
+      "the", "and", "for", "with", "about", "what", "how", "who", "why", "when", "where", "which", "that", "this",
+      "are", "was", "were", "from", "into", "its", "find", "show", "look", "looking", "info", "information", "anything",
+      "something", "page", "pages", "some", "any", "all", "more", "most", "best", "does", "did", "can", "you", "your"};
+  return w.size() < 3 || s.count(w) > 0;
+}
+
+std::string lower_utf8(const std::string& s) { return utf8(lower(wide(s))); }
+
+// The search as words the spider can match right away, before the model has
+// thought of synonyms: the whole phrase, then each word that means something.
+json quick_terms(const std::string& goal) {
+  json out = json::array();
+  std::set<std::string> seen;
+  auto put = [&](const std::string& t) {
+    if (!t.empty() && seen.insert(t).second) out.push_back(t);
+  };
+  const std::string g = utf8(trim(lower(wide(goal))));
+  if (g.empty()) return out;
+  std::string word;
+  std::vector<std::string> words;
+  for (const char c : g + " ") {
+    // Letters, digits, and every byte of a non-English letter stay in the word.
+    if (std::isalnum(static_cast<unsigned char>(c)) || static_cast<unsigned char>(c) >= 0x80 || c == '-' || c == '\'') {
+      word += c;
+    } else if (!word.empty()) {
+      words.push_back(word);
+      word.clear();
+    }
+  }
+  if (words.size() > 1 && g.size() <= 60) put(g);
+  for (const std::string& w : words)
+    if (!stopword(w) || words.size() == 1) put(w);
+  return out;
 }
 
 std::wstring exe_dir() {
@@ -158,12 +198,27 @@ class App {
   json state_msg();
   void apply_settings(const json& partial);
   void reveal(const std::string& url, const std::string& id);
+  void commit_goal(const std::string& goal, bool force);
+  void send_spider(bool on);
+  int matches(const json& f) const;
 
   struct Job {
-    enum Type { Check, Rank, Gist } type;
+    enum Type { Check, Rank, Gist, Expand } type;
     std::string url, id;
     json data;
   };
+
+  // A connected browser and the tab you have open in it.
+  struct Browser {
+    std::string name;  // "Firefox", "Brave"...
+    int tab = -1;
+    std::string url, title;
+    bool web = false;     // a page the spider can go on (not a browser page)
+    bool spider = false;  // the spider is on that tab
+    double at = 0;        // when you last looked at it
+  };
+  // The browser you used last: where Start spider and a search send the spider. Called with mu_ held.
+  const Browser* current(int* client = nullptr) const;
 
   HWND hwnd_ = nullptr;
   HINSTANCE inst_ = nullptr;
@@ -186,8 +241,10 @@ class App {
   Settings settings_;
   Checker checker_;
   Bridge bridge_;
-  std::map<int, std::string> browsers_;  // client -> "Firefox", "Brave"...
-  std::string active_url_;               // the page the spider is on now
+  std::map<int, Browser> browsers_;      // by client
+  std::string active_url_;               // the page "This page" shows: the tab you are on
+  json terms_ = json::array();           // the search as words to match: yours first, then the model's
+  int goal_seq_ = 0;                     // bumps with every search, so a late model answer is dropped
   json status_ = {{"ollama", false}, {"model", ""}};
   std::string busy_;                     // what the worker is doing
   std::deque<Job> urgent_, jobs_;
@@ -205,6 +262,12 @@ class App {
   std::string notice_;
   double notice_at_ = 0;
   json pending_;  // settings changed in the window this frame
+  double goal_edit_at_ = 0;
+  bool goal_dirty_ = false;  // typed in, not sent yet
+  bool goal_force_ = false;
+  bool focus_goal_ = false;  // the window just opened: the search box takes the keyboard
+  std::optional<std::string> pending_goal_;
+  std::optional<bool> pending_spider_;
 };
 
 int App::run(HINSTANCE inst, bool tray) {
@@ -219,6 +282,8 @@ int App::run(HINSTANCE inst, bool tray) {
   checker_.set_model(settings_.model);
   if (!lib_.page_order().empty()) active_url_ = lib_.page_order().front();  // the last page you were on
   snprintf(goal_, sizeof(goal_), "%s", settings_.goal.c_str());
+  terms_ = quick_terms(settings_.goal);
+  if (!settings_.goal.empty()) urgent_.push_back({Job::Expand, "", "", {{"goal", settings_.goal}, {"seq", goal_seq_}}});
 
   const std::wstring host = exe_dir() + L"\\SpiderHost.exe";
   if (_wgetenv(L"SPIDERPET_DATA")) registered_ = true;  // a test copy: leave the real registration alone
@@ -275,24 +340,64 @@ int App::run(HINSTANCE inst, bool tray) {
 // ---------------------------------------------------------------- the brain
 
 json App::state_msg() {
-  return {{"type", "state"}, {"app", kVersion}, {"settings", settings_.to_json()}, {"status", status_}};
+  return {{"type", "state"}, {"app", kVersion},   {"settings", settings_.to_json()},
+          {"status", status_}, {"goal", settings_.goal}, {"terms", terms_}};
+}
+
+const App::Browser* App::current(int* client) const {
+  const Browser* best = nullptr;
+  for (const auto& [c, b] : browsers_)
+    if (b.tab >= 0 && (!best || b.at > best->at)) {
+      best = &b;
+      if (client) *client = c;
+    }
+  return best;
+}
+
+// Ids, titles and sentences that contain a word of the search. Called with mu_ held.
+int App::matches(const json& f) const {
+  if (terms_.empty()) return 0;
+  const std::string t = lower_utf8(jstr(f, "text"));
+  int n = 0;
+  for (const json& w : terms_)
+    if (w.is_string() && t.find(w.get_ref<const std::string&>()) != std::string::npos) ++n;
+  return n;
 }
 
 void App::on_message(int client, const json& m) {
   const std::string type = jstr(m, "type");
   std::unique_lock lock(mu_);
   if (type == "hello") {
-    browsers_[client] = jstr(m, "browser").empty() ? "browser" : jstr(m, "browser");
+    browsers_[client].name = jstr(m, "browser").empty() ? "browser" : jstr(m, "browser");
     const json st = state_msg();
     lock.unlock();
     bridge_.send(client, st);
     wake();
     return;
   }
+  if (type == "tab") {
+    // The tab you are looking at: "This page" follows it, and it is where the spider goes.
+    Browser& b = browsers_[client];
+    b.tab = m.value("tabId", -1);
+    b.url = jstr(m, "url");
+    b.title = jstr(m, "title");
+    b.web = m.value("web", false);
+    b.spider = m.value("spider", false);
+    b.at = now_seconds();
+    if (b.web && !b.url.empty()) active_url_ = b.url;
+    wake();
+    return;
+  }
+  if (type == "notice") {
+    notice_ = jstr(m, "text");
+    notice_at_ = now_seconds();
+    wake();
+    return;
+  }
   if (type == "page") {
     const std::string url = jstr(m, "url");
     if (url.empty()) return;
-    active_url_ = url;
+    if (!current()) active_url_ = url;  // a browser that does not say which tab you are on
     lib_.touch_page(url, jstr(m, "title"), jstr(m, "lang"));
     const json* p = lib_.page(url);
     const bool has_gist = p && p->contains("gist") && (*p)["gist"].is_object() && !(*p)["gist"].contains("error");
@@ -310,7 +415,7 @@ void App::on_message(int client, const json& m) {
   if (type == "finds") {
     const std::string url = jstr(m, "url");
     if (url.empty()) return;
-    active_url_ = url;
+    if (!current()) active_url_ = url;
     const json& finds = m.contains("finds") ? m["finds"] : json::array();
     const auto fresh = lib_.add(url, jstr(m, "title"), jstr(m, "lang"), finds);
     // What was already known from an earlier visit goes straight back.
@@ -324,7 +429,12 @@ void App::on_message(int client, const json& m) {
       const int score = (*x).value("score", -1);
       if (v.is_object() || score >= 0) known[id] = {{"verdict", v}, {"score", score}};
       if (score < 0 && rankable(*x)) unranked.push_back(id);
-      if (settings_.auto_check && !v.is_object() && checkable(*x, settings_)) queue_check(id, false);
+      // A sentence costs two model calls: only the ones that match your
+      // search are checked up front, the rest when the spider eats them.
+      const bool sentence = jstr(*x, "kind") == "sentence";
+      const bool match = f.value("match", 0) > 0;
+      if (settings_.auto_check && !v.is_object() && checkable(*x, settings_) && (!sentence || match))
+        queue_check(id, match);  // what you searched for is checked first
     }
     lock.unlock();
     if (!known.empty()) bridge_.send(client, {{"type", "known"}, {"url", url}, {"items", known}});
@@ -351,6 +461,9 @@ void App::on_message(int client, const json& m) {
       urgent_.push_front(std::move(*it));
       jobs_.erase(it);
       cv_.notify_all();
+    } else if (const json* f = lib_.find(id);
+               f && settings_.auto_check && !(*f)["verdict"].is_object() && checkable(*f, settings_)) {
+      queue_check(id, true);
     }
     return;
   }
@@ -455,9 +568,28 @@ void App::worker() {
         }
         continue;
       }
-      std::deque<Job>& q = urgent_.empty() ? jobs_ : urgent_;
-      job = std::move(q.front());
-      q.pop_front();
+      // While the graphics card is too full for the model, only the work that
+      // needs no model goes on (ids and titles are looked up and compared by words).
+      const bool gpu_busy = checker_.gpu_busy();
+      auto needs_model = [&](const Job& j) {
+        if (j.type != Job::Check) return true;
+        const json* f = lib_.find(j.id);
+        return f && jstr(*f, "kind") == "sentence";
+      };
+      std::deque<Job>* q = nullptr;
+      size_t at = 0;
+      for (std::deque<Job>* d : {&urgent_, &jobs_}) {
+        for (size_t i = 0; i < d->size() && !q; ++i)
+          if (!gpu_busy || !needs_model((*d)[i])) q = d, at = i;
+        if (q) break;
+      }
+      if (!q) {
+        wake();
+        cv_.wait_for(lock, std::chrono::seconds(3), [&] { return quit_.load(); });
+        continue;
+      }
+      job = std::move((*q)[at]);
+      q->erase(q->begin() + static_cast<std::ptrdiff_t>(at));
     }
     if (now_seconds() - status_at > 15) {
       status_at = now_seconds();
@@ -530,10 +662,80 @@ void App::worker() {
         busy_.clear();
       }
       bridge_.broadcast({{"type", "gist"}, {"url", job.url}, {"gist", g}});
+    } else if (job.type == Job::Expand) {
+      const std::string goal = jstr(job.data, "goal");
+      {
+        std::lock_guard lock(mu_);
+        busy_ = "thinking of other words for your search";
+      }
+      wake();
+      const json more = checker_.expand(goal);
+      json terms;
+      {
+        std::lock_guard lock(mu_);
+        busy_.clear();
+        // Only if you have not typed something else in the meantime.
+        if (settings_.goal == goal && job.data.value("seq", -1) == goal_seq_) {
+          std::set<std::string> seen;
+          for (const json& t : terms_) seen.insert(t.get<std::string>());
+          const size_t before = terms_.size();
+          for (const json& t : more)
+            if (t.is_string() && terms_.size() < 20 && !stopword(t.get<std::string>()) && seen.insert(t.get<std::string>()).second)
+              terms_.push_back(t);
+          if (terms_.size() > before) terms = terms_;
+        }
+      }
+      if (terms.is_array()) bridge_.broadcast({{"type", "goal"}, {"goal", goal}, {"terms", terms}});
     }
     wake();
   }
   CoUninitialize();
+}
+
+// A search typed in the window: every spider learns the words at once, the
+// spider on the page you are looking at goes hunting, and the model adds
+// synonyms a moment later.
+void App::commit_goal(const std::string& goal, bool force) {
+  int client = -1;
+  json terms;
+  {
+    std::lock_guard lock(mu_);
+    if (goal == settings_.goal && !force) return;
+    terms_ = quick_terms(goal);
+    terms = terms_;
+    ++goal_seq_;
+    std::erase_if(urgent_, [](const Job& j) { return j.type == Job::Expand; });
+    if (!goal.empty()) {
+      urgent_.push_front({Job::Expand, "", "", {{"goal", goal}, {"seq", goal_seq_}}});
+      cv_.notify_all();
+    }
+    const Browser* b = current(&client);
+    if (!goal.empty() && (!b || !b->web)) {
+      notice_ = b ? "Open a web page in your browser: the spider can't go on this one." : "No browser is connected.";
+      notice_at_ = now_seconds();
+    }
+  }
+  apply_settings({{"goal", goal}});  // saved, and the page is ranked against it
+  const json hunt = {{"type", "hunt"}, {"goal", goal}, {"terms", terms}};
+  const json words = {{"type", "goal"}, {"goal", goal}, {"terms", terms}};
+  std::vector<int> all;
+  {
+    std::lock_guard lock(mu_);
+    for (const auto& [c, b] : browsers_) all.push_back(c);
+  }
+  for (int c : all) bridge_.send(c, c == client && !goal.empty() ? hunt : words);
+}
+
+void App::send_spider(bool on) {
+  int client = -1;
+  json msg;
+  {
+    std::lock_guard lock(mu_);
+    const Browser* b = current(&client);
+    if (!b) return;
+    msg = {{"type", "spider"}, {"on", on}, {"tabId", b->tab}};
+  }
+  bridge_.send(client, msg);
 }
 
 // ---------------------------------------------------------------- window
@@ -629,6 +831,7 @@ void App::show() {
   ShowWindow(hwnd_, IsIconic(hwnd_) ? SW_RESTORE : SW_SHOW);
   SetForegroundWindow(hwnd_);
   visible_ = true;
+  focus_goal_ = true;
 }
 
 void App::hide() {
@@ -801,6 +1004,17 @@ void App::draw() {
     pending_ = nullptr;
     apply_settings(partial);
   }
+  if (pending_goal_) {
+    const std::string g = *pending_goal_;
+    pending_goal_.reset();
+    commit_goal(g, goal_force_);
+    goal_force_ = false;
+  }
+  if (pending_spider_) {
+    const bool on = *pending_spider_;
+    pending_spider_.reset();
+    send_spider(on);
+  }
   ImGui::Render();
   const float clear[4] = {0.055f, 0.059f, 0.078f, 1.f};
   ctx_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
@@ -825,7 +1039,8 @@ void App::draw_header() {
     ImGui::SameLine(0, 0);
   };
   std::set<std::string> names;
-  for (auto& [c, n] : browsers_) names.insert(n);
+  for (auto& [c, br] : browsers_)
+    if (!br.name.empty()) names.insert(br.name);
   std::string b;
   for (const auto& n : names) b += (b.empty() ? "" : ", ") + n;
   dot(!names.empty());
@@ -838,6 +1053,8 @@ void App::draw_header() {
   ImGui::SameLine(0, 18 * scale_);
   dot(settings_.online);
   ImGui::TextUnformatted(settings_.online ? "online checks on" : "online checks off");
+  if (checker_.gpu_busy())
+    ImGui::TextColored(hexv(0xFFC46B), "AI paused: another app is using the graphics card memory. Ids are still checked.");
   const size_t waiting = queued_.size();
   if (!busy_.empty() || waiting) {
     ImGui::TextDisabled("%s%s", busy_.empty() ? "" : busy_.c_str(),
@@ -845,13 +1062,47 @@ void App::draw_header() {
   }
   ImGui::PopFont();
 
-  ImGui::SetNextItemWidth(-1);
-  if (ImGui::InputTextWithHint("##goal", "What are you looking for? The spider goes after that first.", goal_, sizeof(goal_),
-                               ImGuiInputTextFlags_EnterReturnsTrue) ||
-      (ImGui::IsItemDeactivatedAfterEdit())) {
-    pending_ = {{"goal", std::string(goal_)}};  // applied after this frame, outside the lock
+  // The search and the spider's switch. Typing is enough: a short pause sends
+  // the spider after it; Enter sends it again (on a new page, say).
+  const Browser* cur = current();
+  const bool on = cur && cur->spider;
+  const char* label = on ? "Stop spider" : "Start spider";
+  const float bw = ImGui::CalcTextSize("Start spider").x + ImGui::GetStyle().FramePadding.x * 2 + 8 * scale_;
+  ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
+  if (focus_goal_) {
+    ImGui::SetKeyboardFocusHere();
+    focus_goal_ = false;
   }
-  if (!notice_.empty() && now_seconds() - notice_at_ < 4) ImGui::TextColored(hexv(0x8BF5A6), "%s", notice_.c_str());
+  const bool enter = ImGui::InputTextWithHint("##goal", "What are you looking for? Type it and the spider hunts for it.", goal_,
+                                              sizeof(goal_), ImGuiInputTextFlags_EnterReturnsTrue);
+  if (ImGui::IsItemEdited()) {
+    goal_dirty_ = true;
+    goal_edit_at_ = now_seconds();
+  }
+  if (enter || (goal_dirty_ && now_seconds() - goal_edit_at_ > 0.7)) {
+    goal_dirty_ = false;
+    goal_force_ = enter;
+    pending_goal_ = std::string(goal_);  // sent after this frame, outside the lock
+  }
+  ImGui::SameLine();
+  ImGui::BeginDisabled(!cur || (!cur->web && !on));
+  if (on) {
+    ImGui::PushStyleColor(ImGuiCol_Button, hexv(0x5A2368));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hexv(0x6E2C80));
+  }
+  if (ImGui::Button(label, ImVec2(bw, 0))) pending_spider_ = !on;
+  if (on) ImGui::PopStyleColor(2);
+  ImGui::EndDisabled();
+
+  // Where the spider would go: the tab you are on in your browser.
+  ImGui::PushFont(small_, small_->LegacySize);
+  if (!cur) ImGui::TextDisabled("Open your browser: the spider works on the tab you are looking at.");
+  else if (!cur->web) ImGui::TextDisabled("%s tab: a browser page. Open a web page for the spider.", cur->name.c_str());
+  else
+    ImGui::TextDisabled("%s tab: %s%s", cur->name.c_str(), cur->title.substr(0, 80).c_str(),
+                        on ? (terms_.empty() ? "   (spider on)" : "   (spider hunting)") : "");
+  ImGui::PopFont();
+  if (!notice_.empty() && now_seconds() - notice_at_ < 6) ImGui::TextColored(hexv(0xFFC46B), "%s", notice_.c_str());
   ImGui::Spacing();
 }
 
@@ -876,6 +1127,15 @@ void App::draw_find(const json& f, bool show_page) {
     dl->AddRectFilled(ImVec2(p.x - pad, p.y - 1), ImVec2(p.x + sz.x + pad, p.y + sz.y + 1), ImGui::GetColorU32(hexv(pill.bg)),
                       4.f * scale_);
     ImGui::TextColored(hexv(pill.fg), "%s", pill.text);
+  }
+  if (matches(f) > 0) {
+    ImGui::SameLine();
+    const char* mt = "MATCH";
+    const ImVec2 sz = ImGui::CalcTextSize(mt);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    dl->AddRectFilled(ImVec2(p.x - pad, p.y - 1), ImVec2(p.x + sz.x + pad, p.y + sz.y + 1), ImGui::GetColorU32(hexv(0xFFC46B)),
+                      4.f * scale_);
+    ImGui::TextColored(hexv(0x1E120C), "%s", mt);
   }
   const int score = f.value("score", -1);
   if (score >= 0) {
@@ -937,15 +1197,14 @@ void App::draw_find(const json& f, bool show_page) {
 }
 
 void App::draw_page() {
-  if (active_url_.empty()) {
+  const json* p = active_url_.empty() ? nullptr : lib_.page(active_url_);
+  if (!p) {
     ImGui::Spacing();
-    ImGui::TextWrapped("Open a page in your browser and press the spider button in the toolbar. "
+    ImGui::TextWrapped("Open a page in your browser. Then type what you are looking for above, or press Start spider. "
                        "What the spider finds shows up here, with a check for each find.");
     if (!registered_) ImGui::TextColored(hexv(0xFF5C5C), "The browser connection is not set up. See Setup.");
     return;
   }
-  const json* p = lib_.page(active_url_);
-  if (!p) return;
   ImGui::PushFont(bold_, bold_->LegacySize);
   ImGui::TextWrapped("%s", jstr(*p, "title").c_str());
   ImGui::PopFont();
@@ -967,27 +1226,31 @@ void App::draw_page() {
   }
   ImGui::Spacing();
 
-  std::vector<const json*> list;
+  std::vector<std::pair<int, const json*>> list;  // (how many search words it has, the find)
   for (const std::string& id : lib_.finds_of(active_url_)) {
     auto it = lib_.finds().find(id);
-    if (it != lib_.finds().end()) list.push_back(&*it);
+    if (it != lib_.finds().end()) list.push_back({matches(*it), &*it});
   }
-  // Most relevant first, problems before quiet ones at the same relevance.
-  std::stable_sort(list.begin(), list.end(), [](const json* a, const json* b) {
-    const int sa = a->value("score", -1), sb = b->value("score", -1);
+  // What matches your search first, then the most relevant, problems before
+  // quiet ones at the same relevance.
+  std::stable_sort(list.begin(), list.end(), [](const auto& a, const auto& b) {
+    if ((a.first > 0) != (b.first > 0)) return a.first > 0;
+    const int sa = a.second->value("score", -1), sb = b.second->value("score", -1);
     if (sa != sb) return sa > sb;
-    return problem((*a)["verdict"]) && !problem((*b)["verdict"]);
+    return problem((*a.second)["verdict"]) && !problem((*b.second)["verdict"]);
   });
-  int verified = 0, problems = 0;
-  for (const json* f : list) {
+  int verified = 0, problems = 0, matched = 0;
+  for (const auto& [m, f] : list) {
     verified += jstr((*f)["verdict"], "status") == "verified" ? 1 : 0;
     problems += problem((*f)["verdict"]) ? 1 : 0;
+    matched += m > 0 ? 1 : 0;
   }
   ImGui::PushFont(small_, small_->LegacySize);
-  ImGui::TextDisabled("%zu finds   %d verified   %d problems", list.size(), verified, problems);
+  if (terms_.empty()) ImGui::TextDisabled("%zu finds   %d verified   %d problems", list.size(), verified, problems);
+  else ImGui::TextDisabled("%d match your search   %zu finds   %d verified   %d problems", matched, list.size(), verified, problems);
   ImGui::PopFont();
   ImGui::BeginChild("##finds", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
-  for (const json* f : list) draw_find(*f, false);
+  for (const auto& [m, f] : list) draw_find(*f, false);
   ImGui::EndChild();
 }
 
@@ -1048,7 +1311,7 @@ void App::draw_settings() {
   ImGui::Unindent();
   ImGui::PopFont();
   changed |= ImGui::Checkbox("Check every find as it is harvested", &s.auto_check);
-  changed |= ImGui::Checkbox("Check claims in sentences too (slower)", &s.check_sentences);
+  changed |= ImGui::Checkbox("Check claims in sentences the spider reads or that match your search (slower)", &s.check_sentences);
   changed |= ImGui::Checkbox("Let the spider scroll pages by itself", &s.crawl);
 
   ImGui::Spacing();

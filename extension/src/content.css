@@ -59,8 +59,42 @@
   border-radius: 2px !important;
 }
 
-::highlight(spiderpet-eaten) { background-color: var(--sp-eaten); }
-::highlight(spiderpet-reading) { background-color: var(--sp-read); }
+/* The other two looks for each kind, as on the desktop spider: every find
+   gets one of three, picked by its id. */
+.spiderpet-title.spiderpet-v1 {
+  font-style: normal !important;
+  color: var(--sp-blue) !important;
+  background: none !important;
+  outline: 1.5px solid var(--sp-blue) !important;
+  outline-offset: 1px !important;
+}
+.spiderpet-title.spiderpet-v2 {
+  font-family: "Segoe UI", system-ui, sans-serif !important;
+  font-style: normal !important;
+  font-weight: 600 !important;
+  font-size: 1.2em !important;
+  color: var(--sp-magenta) !important;
+  background: none !important;
+}
+.spiderpet-doi.spiderpet-v1 { color: inherit !important; outline: 1.5px solid var(--sp-magenta) !important; outline-offset: 1px !important; }
+.spiderpet-doi.spiderpet-v2 { font-size: 1.3em !important; letter-spacing: .08em !important; }
+.spiderpet-isbn.spiderpet-v1 { font-size: 1.12em !important; outline: 1.5px solid var(--sp-blue) !important; outline-offset: 1px !important; }
+.spiderpet-isbn.spiderpet-v2 { color: var(--sp-cyan) !important; font-size: 1.25em !important; }
+.spiderpet-id.spiderpet-v1 { color: var(--sp-magenta) !important; background: none !important; outline: 1.5px solid var(--sp-magenta) !important; outline-offset: 1px !important; }
+.spiderpet-id.spiderpet-v2 { font-family: Georgia, "Times New Roman", serif !important; font-size: 1.25em !important; color: var(--sp-green) !important; background: none !important; }
+.spiderpet-heading { font-weight: 700 !important; }
+.spiderpet-link.spiderpet-v1 { color: var(--sp-magenta) !important; outline-color: var(--sp-green) !important; }
+.spiderpet-link.spiderpet-v2 { color: var(--sp-cyan) !important; outline-color: var(--sp-magenta) !important; }
+
+/* Sentences: a soft fill and an underline that sweeps as the spider reads,
+   magenta for key sentences, blue for the rest; fainter once read. */
+::highlight(spiderpet-reading) { background-color: rgba(51, 70, 224, 0.18); text-decoration: underline 1.6px rgba(51, 70, 224, 0.95); text-underline-offset: 3px; }
+::highlight(spiderpet-reading-key) { background-color: rgba(180, 20, 200, 0.18); text-decoration: underline 1.6px rgba(180, 20, 200, 0.95); text-underline-offset: 3px; }
+::highlight(spiderpet-eaten) { background-color: rgba(51, 70, 224, 0.09); text-decoration: underline 1.6px rgba(51, 70, 224, 0.55); text-underline-offset: 3px; }
+::highlight(spiderpet-eaten-key) { background-color: rgba(180, 20, 200, 0.09); text-decoration: underline 1.6px rgba(180, 20, 200, 0.55); text-underline-offset: 3px; }
+/* What you searched for, everywhere on the page. */
+::highlight(spiderpet-goal) { background-color: rgba(255, 196, 107, 0.55); color: #1E120C; }
+:root[data-spiderpet-dark]::highlight(spiderpet-reading) { background-color: rgba(125, 139, 255, 0.18); text-decoration-color: rgba(125, 139, 255, 0.95); }
 
 /* The glitch when the spider bites. */
 .spiderpet-glitch { animation: spiderpet-glitch .5s steps(2, end) 1; }
