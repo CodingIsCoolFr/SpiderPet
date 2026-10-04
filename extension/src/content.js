@@ -616,9 +616,8 @@
   const say = {
     land: () => pick(['new habitat.', 'touching down.', 'host acquired.', 'tasting the surface…']),
     sense: () => pick(['sensing…', 'probing.', 'scanning substrate.', 'signals…']),
-    crawl: () => pick(['crawling deeper.', 'more substrate below.', 'descending the page.']),
-    drained: () => pick(['habitat drained.', 'nothing left in reach.']),
-    more: () => pick(['more below. scroll me.', 'page goes on. scroll?', 'hungry. more below.']),
+    drained: () => pick(['habitat drained.', 'whole page read.']),
+    more: () => pick(['reading the rest out of sight.', 'working on the rest of the page.', 'the rest of the page is mine too.']),
     lifted: () => pick(['!! displaced', 'lifted. hostile?', 'put me down.']),
     landed: () => pick(['relocated.', 'recalibrating…', 'new coordinates.']),
     offline: () => 'no link to the hive. start SpiderPet.exe',
@@ -1261,8 +1260,6 @@
   let target = null;
   let tether = null;
   let modeAt = 0;
-  let userScrolledAt = -100;
-  let ourScrollAt = -100;
   let lastScanAt = 0;
   let chooseAt = 0;
   let domDirty = true;
@@ -1347,6 +1344,7 @@
       finds.push(f);
       fresh.push(f);
     }
+    if (fresh.length) pageDoneSaid = false;
     const list = sendAll ? finds : fresh;
     if (list.length)
       api.runtime.sendMessage({
@@ -1404,31 +1402,57 @@
     return V(clamp(x, scrollX + 20, scrollX + innerWidth - 20), clamp(y, scrollY + 20, scrollY + innerHeight - 20));
   }
 
-  // The next match the spider has not eaten: below the view first, in reading order.
-  function nextMatch() {
-    const below = scrollY + innerHeight - 20;
-    let down = null, up = null;
+  // The rest of the page, out of view: the spider works through it in the
+  // background, one find at a time, and never scrolls your page to get
+  // there. You see it at work on the part you are looking at.
+  let offAt = 0;
+  let offSaidAt = -100;
+  let pageDoneSaid = false;
+  let scrolledAt = -100; // you are scrolling: background work waits a moment
+  const inView = (b) => b.y + b.h > scrollY && b.y < scrollY + innerHeight;
+  function eatOffscreen(t) {
+    let best = null;
+    let bestRank = -1e9;
     for (const f of finds) {
-      if (f.eaten || f.page || !(matchOf(f) > 0 || f.score >= 7)) continue;
-      const b = boxOf(f);
-      if (!b) continue;
-      if (b.y > below) {
-        if (!down || b.y < down.b.y) down = { f, b };
-      } else if (b.y + b.h < scrollY + 4) {
-        if (!up || b.y < up.b.y) up = { f, b };
+      if (f.eaten || f.page || (f.skipOff && t - f.skipOff < 3)) continue;
+      // On a hunt only what matches; otherwise the most valuable first, in reading order.
+      const m = terms.length ? matchOf(f) : 0;
+      if (terms.length && m === 0 && !(f.score >= 7)) continue;
+      const rank = m * 10 + (KIND_PRIO[f.kind] ?? 1) + (f.key ? 0.8 : 0) - f.order / 10000;
+      if (rank > bestRank) {
+        bestRank = rank;
+        best = f;
       }
     }
-    return down || up;
-  }
-
-  function atBottom() {
-    return scrollY + innerHeight >= document.documentElement.scrollHeight - 8;
-  }
-
-  function crawlOn(t, k) {
-    ourScrollAt = t;
-    window.scrollBy({ top: innerHeight * (terms.length ? 0.8 : 0.7), behavior: 'smooth' });
-    spider.setGoal(V(spider.pos.x, scrollY + innerHeight * 0.75), 260 * k, 80 * k);
+    if (!best) {
+      // The whole page is done: say so once.
+      if (!pageDoneSaid && mode === 'rest') {
+        pageDoneSaid = true;
+        think(terms.length ? say.huntDone(found) : say.drained());
+      }
+      return false;
+    }
+    const b = boxOf(best);
+    if (!b) {
+      best.eaten = true; // it is not on the page any more
+      return true;
+    }
+    if (inView(b)) {
+      best.skipOff = t; // in view: the spider walks to this one itself (unless you scroll on)
+      return true;
+    }
+    restyle(best);
+    best.eaten = true;
+    api.runtime.sendMessage({ type: 'eaten', id: best.id }).catch(() => {});
+    badge(best);
+    if (terms.length && matchOf(best) > 0) {
+      found++;
+      if (t - offSaidAt > 3 && mode !== 'eat' && mode !== 'lasso') {
+        offSaidAt = t;
+        think(`${found} found so far. one ${b.y < scrollY ? 'above' : 'below'} you.`);
+      }
+    }
+    return true;
   }
 
   function step(t, dt) {
@@ -1443,6 +1467,11 @@
       lastUrl = pageUrl();
       reset();
       return;
+    }
+    // The part of the page you are not looking at, in the background (not while you scroll).
+    if (app.settings?.crawl !== false && t - offAt > 0.25 && t - scrolledAt > 0.4) {
+      offAt = t;
+      eatOffscreen(t);
     }
     // Left behind (you jumped down the page, or it scrolled away): drop back
     // in on a thread instead of walking the whole way.
@@ -1485,10 +1514,7 @@
           if (f) {
             target = f;
             const b = boxOf(f);
-            if (b) {
-              ourScrollAt = t;
-              window.scrollTo({ top: b.y - innerHeight * 0.4, behavior: 'smooth' });
-            }
+            if (b) window.scrollTo({ top: b.y - innerHeight * 0.4, behavior: 'smooth' }); // you asked to see it
             f.eaten = false;
           }
         }
@@ -1498,25 +1524,13 @@
           chooseAt = t;
           target = chooseTarget();
           if (!target) {
-            // Out of food in view: look again if the page changed (lazy pages), then crawl down.
+            // Nothing left in view: look again if the page changed (lazy pages),
+            // and rest here while the rest of the page is worked through out of sight.
             if (domDirty && t - lastScanAt > scanGap) rescanSoon();
-            // On a hunt it jumps straight to the next match and drops in on a thread.
-            if (terms.length && t - ourScrollAt > 0.9) {
-              const next = nextMatch();
-              if (next) {
-                ourScrollAt = t;
-                think(say.tracking());
-                window.scrollTo({ top: Math.max(0, next.b.y - innerHeight * 0.35), behavior: 'smooth' });
-                break;
-              }
-            }
-            const crawl = app.settings?.crawl !== false || terms.length;
-            if (crawl && !atBottom() && t - userScrolledAt > (terms.length ? 2 : 4) && t - ourScrollAt > (terms.length ? 0.9 : 1.2)) {
-              think(terms.length ? say.tracking() : say.crawl());
-              crawlOn(t, k);
-            } else if (t - ourScrollAt > 1.5 && !restingSaid) {
+            if (!restingSaid) {
               restingSaid = true;
-              think(terms.length && atBottom() ? say.huntDone(found) : atBottom() ? say.drained() : say.more());
+              const left = finds.some((f) => !f.eaten && !f.page && (!terms.length || matchOf(f) > 0));
+              think(terms.length ? (left ? say.tracking() : say.huntDone(found)) : left ? say.more() : say.drained());
               setMode('rest');
             }
             break;
@@ -1584,8 +1598,6 @@
         if (domDirty && t - lastScanAt > scanGap) rescanSoon();
         if (t - modeAt > 1.5 && chooseTarget()) {
           restingSaid = false;
-          setMode('walk');
-        } else if (t - modeAt > 6 && app.settings?.crawl !== false && !atBottom() && t - userScrolledAt > 4) {
           setMode('walk');
         }
         break;
@@ -1680,15 +1692,14 @@
     spider.airborne = false;
     spider.place(spider.pos);
     think(say.landed());
-    userScrolledAt = now();
     setMode('walk');
   });
 
-  const markUser = () => {
-    if (now() - ourScrollAt > 1.2) userScrolledAt = now();
+  // You are scrolling: the background work pauses so nothing moves under your hand.
+  const onScroll = () => {
+    scrolledAt = now();
   };
   const onKey = (e) => {
-    if (['PageDown', 'PageUp', 'ArrowDown', 'ArrowUp', ' ', 'Home', 'End'].includes(e.key)) markUser();
     if (e.key === 'Escape' && e.shiftKey) stop();
   };
 
@@ -1700,6 +1711,7 @@
     terms = goal ? [...new Set((list || []).map((x) => String(x).toLowerCase().trim()).filter((x) => x.length >= 2))] : [];
     if (changed) {
       found = 0;
+      pageDoneSaid = false;
       restingSaid = false;
       if (mode === 'walk' || mode === 'rest') {
         target = null;
@@ -1774,6 +1786,7 @@
   // ------------------------------------------------------------------ life
 
   function reset() {
+    pageDoneSaid = false;
     finds = [];
     byId.clear();
     anchors.clear();
@@ -1827,8 +1840,7 @@
     summonedAt = now();
     setMode('drop');
     addEventListener('resize', resize);
-    addEventListener('wheel', markUser, { passive: true });
-    addEventListener('touchmove', markUser, { passive: true });
+    addEventListener('scroll', onScroll, { passive: true });
     addEventListener('keydown', onKey);
     api.runtime.onMessage.addListener(onMessage);
     observer.observe(document.body, { childList: true, subtree: true });
@@ -1844,8 +1856,7 @@
     host.remove();
     observer.disconnect();
     removeEventListener('resize', resize);
-    removeEventListener('wheel', markUser);
-    removeEventListener('touchmove', markUser);
+    removeEventListener('scroll', onScroll);
     removeEventListener('keydown', onKey);
     api.runtime.onMessage.removeListener(onMessage);
     if (HIGHLIGHTS) {

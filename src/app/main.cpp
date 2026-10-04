@@ -47,7 +47,7 @@ namespace {
 constexpr UINT kTrayMsg = WM_APP + 1;
 constexpr UINT kShowMsg = WM_APP + 2;
 constexpr UINT kWakeMsg = WM_APP + 3;
-constexpr const char* kVersion = "3.2.0";
+constexpr const char* kVersion = "3.2.1";
 
 ImVec4 hexv(uint32_t c, float a = 1.f) {
   return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
@@ -1653,7 +1653,7 @@ void App::draw_settings() {
   ImGui::PopFont();
   changed |= ImGui::Checkbox("Check every find as it is harvested", &s.auto_check);
   changed |= ImGui::Checkbox("Check claims in sentences the spider reads or that match your search (slower)", &s.check_sentences);
-  changed |= ImGui::Checkbox("Let the spider scroll pages by itself", &s.crawl);
+  changed |= ImGui::Checkbox("Work through the whole page, not only the part you see (it never scrolls your page)", &s.crawl);
   changed |= ImGui::Checkbox("Tuck away popups, cookie banners and sign-up walls that block the page", &s.popups);
   ImGui::PushFont(small_, small_->LegacySize);
   ImGui::Indent();

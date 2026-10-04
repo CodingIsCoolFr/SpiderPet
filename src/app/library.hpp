@@ -12,7 +12,7 @@ struct Settings {
   bool online = true;          // look finds up in Crossref, PubMed, Wikipedia...
   bool auto_check = true;      // check every find as it is harvested
   bool check_sentences = true; // also check claims (slower: two model calls each)
-  bool crawl = true;           // the spider may scroll the page by itself
+  bool crawl = true;           // work through the whole page, out of sight too (it never scrolls)
   bool popups = true;          // tuck away popups, cookie banners and sign-up walls that block the page
   std::string model;           // empty = best installed
 
