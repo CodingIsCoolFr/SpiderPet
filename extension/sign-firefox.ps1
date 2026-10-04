@@ -54,6 +54,13 @@ function Call($method, $url, $data) {
   } catch {
     # Mozilla says what is wrong in the reply; show that, not just "400 Bad Request".
     $why = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+    # Too many requests in a row: Mozilla says how long to wait (up to half an hour). Wait, then go again.
+    if ($why -match 'throttled.*available in (\d+) seconds' -and [int]$Matches[1] -le 1800) {
+      $wait = [int]$Matches[1] + 3
+      Write-Host "Mozilla asks to wait $([math]::Ceiling($wait / 60)) minute(s). Waiting; leave this window open..."
+      Start-Sleep $wait
+      return Call $method $url $data
+    }
     throw "$method $url failed: $why"
   }
 }
