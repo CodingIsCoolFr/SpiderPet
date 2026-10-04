@@ -9,6 +9,7 @@
 # Result: extension\spiderpet-firefox.xpi. Drag it into Firefox and click Add.
 param([string]$Key = $env:AMO_JWT_ISSUER, [string]$Secret = $env:AMO_JWT_SECRET)
 $ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12  # Mozilla only speaks TLS 1.2+
 $here = $PSScriptRoot
 $zip = Join-Path $here "spiderpet-firefox-unsigned.zip"
 if (-not (Test-Path $zip)) { & (Join-Path $here "build.ps1") }

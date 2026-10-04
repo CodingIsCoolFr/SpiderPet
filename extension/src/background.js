@@ -13,7 +13,8 @@ const app = { connected: false, error: '', settings: {}, status: {}, version: ''
 // Per tab: the page the spider is on, what it found, and what the app said.
 const tabs = new Map(); // tabId -> { url, title, finds: Map(id -> find), gist, spider: bool }
 const pendingReveal = new Map(); // tabId -> find id, for pages opened from the library
-let lastSpiderTab = null; // the panel falls back to it when the active tab is not a web page
+let lastSpiderTab = null; // the panel falls back to these when the active tab is not a web page
+let lastWebTab = null;
 
 function cleanUrl(u) {
   try {
@@ -231,6 +232,7 @@ async function loadSpiderTabs() {
 }
 
 api.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (tab.active && tab.url?.startsWith('http')) lastWebTab = tabId;
   const t = tabs.get(tabId);
   if (!t || !t.spider) return;
   if (info.status === 'complete' && tab.url?.startsWith('http')) {
@@ -249,7 +251,13 @@ api.tabs.onRemoved.addListener((tabId) => {
   saveSpiderTabs();
 });
 
-api.tabs.onActivated.addListener(() => tellPanels());
+api.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const t = await api.tabs.get(tabId);
+    if (t.url?.startsWith('http')) lastWebTab = tabId;
+  } catch {}
+  tellPanels();
+});
 
 api.action.onClicked.addListener(async (tab) => {
   // Open the panel first: both browsers only allow it right inside the click.
@@ -324,7 +332,8 @@ api.runtime.onMessage.addListener((m, sender, reply) => {
     case 'panel-get': {
       (async () => {
         let [tab] = await api.tabs.query({ active: true, currentWindow: true });
-        if ((!tab || !tab.url?.startsWith('http')) && lastSpiderTab != null) tab = await api.tabs.get(lastSpiderTab).catch(() => tab);
+        const fallback = lastSpiderTab ?? lastWebTab;
+        if ((!tab || !tab.url?.startsWith('http')) && fallback != null) tab = await api.tabs.get(fallback).catch(() => tab);
         const t = tab ? tabs.get(tab.id) : null;
         reply({
           app,
