@@ -19,7 +19,10 @@ class Scene {
   // ours is painted inside them.
   void draw(Painter& p, const Page& page, const Pet& pet, const Settings& s, Vec2 offset, const Rect& clip,
             const std::vector<Rect>& holes, double now, float dim, float dt);
-  void forget() { layouts_.clear(); }
+  void forget() {
+    plans_.clear();
+    masks_.clear();
+  }
 
   // The thought bubble can be dragged and pinned (target-local pixels).
   bool bubble_hit(Vec2 local) const { return bubble_shown_ && bubble_box_.inflated(4.f).contains(local); }
@@ -44,17 +47,29 @@ class Scene {
     D2D1_COLOR_F outline_color{};
   };
   Style style_for(const Entity& e, const Palette& pal) const;
-  IDWriteTextLayout* layout_for(Painter& p, const Page& page, const Entity& e, const Style& st);
-  void decal(Painter& p, const Palette& pal, const Page& page, const Entity& e, Vec2 off, double now);
+  struct Plan {
+    uint64_t key = 0;
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;  // null: repaint the real letters instead
+    Rect ink;                                          // the layout's ink, from its draw point
+    float tilt = 0;
+    Vec2 nudge{};
+  };
+  const Plan& plan_for(Painter& p, const Entity& e, const Style& st, const Glyphs* g);
+  ID2D1Bitmap* letters(Painter& p, const Entity& e, size_t line);
+  void ink(Painter& p, ID2D1Bitmap* letters, const Rect& at, D2D1_COLOR_F c);
+  void repaint(Painter& p, const Palette& pal, const Style& st, const Entity& e, size_t line, Vec2 off, float age);
+  void decal(Painter& p, const Palette& pal, const Entity& e, Vec2 off, double now);
   void sentence(Painter& p, const Palette& pal, const Entity& e, Vec2 off, float progress, bool live);
   void labels(Painter& p, const Palette& pal, const Page& page, const Pet& pet, Vec2 off, const Rect& clip,
               double now, float dt);
 
-  struct Cached {
-    Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;
-    uint64_t key = 0;
+  std::unordered_map<int, Plan> plans_;
+  struct Mask {
+    Microsoft::WRL::ComPtr<ID2D1Bitmap1> bmp;
+    uint32_t stamp = 0;
   };
-  std::unordered_map<int, Cached> layouts_;
+  std::unordered_map<uint64_t, Mask> masks_;
+  ID2D1DeviceContext* mask_ctx_ = nullptr;
   Microsoft::WRL::ComPtr<IDWriteTextLayout> name_layout_, small_name_;
   std::wstring name_text_;
   Vec2 name_pos_{};

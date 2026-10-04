@@ -79,45 +79,151 @@ Scene::Style Scene::style_for(const Entity& e, const Palette& pal) const {
   return s;
 }
 
-// The new look may grow only into empty space. Where other text is close
-// (a row of footer links, a dense reference list), it is shrunk to fit the
-// original spot so restyled words never pile onto their neighbors.
-IDWriteTextLayout* Scene::layout_for(Painter& p, const Page& page, const Entity& e, const Style& st) {
+namespace {
+
+// Where the ink of a layout sits, relative to the point it is drawn at.
+Rect ink_box(IDWriteTextLayout* l) {
+  DWRITE_OVERHANG_METRICS om{};
+  l->GetOverhangMetrics(&om);
+  return {-om.left, -om.top, l->GetMaxWidth() + om.right + om.left, l->GetMaxHeight() + om.bottom + om.top};
+}
+
+// Lifted letters belong to a line while they still sit on it.
+bool on_line(const Glyphs& g, const Rect& line) {
+  if (!g.ok()) return false;
+  return overlap_area(g.at, line) >= 0.6f * line.w * line.h && g.at.w <= line.w + 2.f * line.h + 6.f &&
+         g.at.h <= line.h * 2.2f + 6.f;
+}
+
+}  // namespace
+
+// How a one-line find gets its new look, worked out once per look and spot.
+// Screen translators fit new text into the old box; here the new text may
+// also use clean paper next to it, measured in the captured pixels, so icons
+// and neighbors count too. With too little room, the real letters are
+// repainted in place instead: same shapes, new look, nothing moves.
+const Scene::Plan& Scene::plan_for(Painter& p, const Entity& e, const Style& st, const Glyphs* g) {
   const Rect& r = e.lines.front();
-  const float size = e.font_px * st.size;
-  const uint64_t key = (static_cast<uint64_t>(fnv1a(e.text)) << 24) ^ (static_cast<uint64_t>(size * 8.f) << 8) ^
-                       (static_cast<uint64_t>(r.w) << 40) ^ static_cast<uint64_t>(st.family * 3 + e.variant);
-  Cached& c = layouts_[e.id];
-  if (c.layout && c.key == key) return c.layout.Get();
+  uint64_t key = (static_cast<uint64_t>(fnv1a(e.text)) << 20) ^ static_cast<uint64_t>(st.family * 3 + e.variant) ^
+                 (static_cast<uint64_t>(r.w) << 52) ^ (static_cast<uint64_t>(e.font_px * 4.f) << 8) ^ 1;
+  if (g) key ^= (static_cast<uint64_t>(g->stamp) << 13) ^ static_cast<uint64_t>(g->room_r * 7.f + g->room_t * 3.f + g->room_b);
+  Plan& plan = plans_[e.id];
+  if (plan.key == key) return plan;
+  plan = {};
+  plan.key = key;
   const Fonts& f = p.fonts();
   const std::wstring& family = st.family == 0 ? f.serif : st.family == 1 ? f.mono : f.sans;
-  c.layout = p.layout(e.text, p.format(family, size, st.weight, st.italic), st.spacing);
-  c.key = key;
-  if (!c.layout) return nullptr;
-  DWRITE_TEXT_METRICS m{};
-  c.layout->GetMetrics(&m);
-  const float w = m.widthIncludingTrailingWhitespace, h = m.height;
-  const Rect grown{r.x - 3.f, r.center().y - h * 0.5f, w + 6.f, h};
-  bool crowded = false;
-  for (const TextLine& l : page.lines()) {
-    if (l.box.bottom() < grown.y - 2.f) continue;
-    if (l.box.y > grown.bottom() + 2.f) break;
-    const bool own = l.box.contains(r.center());
-    for (const OcrWord& wd : l.words) {
-      if (r.inflated(1.f).contains(wd.box.center())) continue;  // our own words
-      const float ov = overlap_area(grown, wd.box);
-      if (ov > (own ? 1.f : 0.15f * wd.box.w * wd.box.h)) {
-        crowded = true;
-        break;
-      }
+  const float want = e.font_px * st.size;
+  auto make = [&](float size) {
+    plan.layout = p.layout(e.text, p.format(family, size, st.weight, st.italic), st.spacing * size / want);
+    if (plan.layout) plan.ink = ink_box(plan.layout.Get());
+    return plan.layout != nullptr && plan.ink.w > 0 && plan.ink.h > 0;
+  };
+  if (!make(want)) {
+    plan.layout.Reset();
+    return plan;
+  }
+
+  if (!g) {
+    // Nothing lifted (a busy background): squeeze into the old box.
+    const float k = std::clamp(std::min({1.f, (r.w + 2.f) / plan.ink.w, (r.h * 1.25f + 2.f) / plan.ink.h}), 0.5f, 1.f);
+    if (k < 0.99f) make(want * k);
+    return plan;
+  }
+
+  // New text is written only over plain letters that spell it. A row of
+  // parts, a button or tag, or a box that also holds an icon or a counter is
+  // repainted instead, so nothing in it is lost.
+  const float says = plan.ink.w / st.size / static_cast<float>(g->w);
+  if (e.kind == Kind::Item || g->chip || g->stray > 0.1f || !g->literal || says < 0.7f || says > 1.45f) {
+    plan.layout.Reset();
+    return plan;
+  }
+  // Room: the text grows to the right; up and down it gets half of the gap,
+  // because the line next door may grow too.
+  const float pad = (st.fill || st.outline) ? 3.f : 0.f;
+  const float keep = std::max(4.f, 0.45f * g->at.h);  // a word gap stays a word gap
+  const float right = g->at.right() + std::max(0.f, g->room_r - keep);
+  const float up = g->at.h * 0.5f + std::max(0.f, g->room_t * 0.5f - 1.f);
+  const float down = g->at.h * 0.5f + std::max(0.f, g->room_b * 0.5f - 1.f);
+  const float left_pad = std::min(pad, std::max(0.f, g->room_l - 1.f));
+  auto fit = [&]() {
+    return std::min({1.f, (right - g->at.x - pad) / (plan.ink.w + left_pad), 2.f * (std::min(up, down) - pad) / plan.ink.h});
+  };
+  const float k = fit();
+  if (k < 0.995f) {
+    if (want * k < e.font_px * 0.88f) {  // it would have to shrink too much
+      plan.layout.Reset();
+      return plan;
     }
-    if (crowded) break;
+    make(want * k);
+    if (fit() < 0.97f) {
+      plan.layout.Reset();
+      return plan;
+    }
   }
-  if (crowded) {
-    const float k = std::clamp(std::min(r.w * 1.04f / std::max(1.f, w), (r.h + 4.f) * 1.15f / std::max(1.f, h)), 0.55f, 1.f);
-    if (k < 0.99f) c.layout = p.layout(e.text, p.format(family, size * k, st.weight, st.italic), st.spacing * k);
+  // A tilt only where the turned text still stays on clean paper.
+  if (e.tilt != 0) {
+    const float slack = std::min(up, down) - plan.ink.h * 0.5f - pad;
+    if (slack >= plan.ink.w * std::fabs(std::sin(e.tilt)) + std::fabs(e.nudge.y)) {
+      plan.tilt = e.tilt;
+      plan.nudge = {0, e.nudge.y};
+    }
   }
-  return c.layout.Get();
+  return plan;
+}
+
+// The lifted letters of one line as an alpha bitmap, rebuilt only when the
+// letters change.
+ID2D1Bitmap* Scene::letters(Painter& p, const Entity& e, size_t line) {
+  if (p.ctx() != mask_ctx_) {
+    masks_.clear();
+    mask_ctx_ = p.ctx();
+  }
+  const Glyphs& g = e.glyphs[line];
+  Mask& m = masks_[(static_cast<uint64_t>(e.id) << 8) | (line & 0xFF)];
+  if (m.bmp && m.stamp == g.stamp) return m.bmp.Get();
+  m.bmp.Reset();
+  m.stamp = g.stamp;
+  const D2D1_BITMAP_PROPERTIES1 props =
+      D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+  p.ctx()->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(g.w), static_cast<UINT32>(g.h)), g.a.data(),
+                        static_cast<UINT32>(g.w), &props, &m.bmp);
+  return m.bmp.Get();
+}
+
+void Scene::ink(Painter& p, ID2D1Bitmap* letters, const Rect& at, D2D1_COLOR_F c) {
+  ID2D1DeviceContext* ctx = p.ctx();
+  const D2D1_ANTIALIAS_MODE was = ctx->GetAntialiasMode();
+  ctx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);  // FillOpacityMask needs it
+  const D2D1_RECT_F dst = D2D1::RectF(at.x, at.y, at.right(), at.bottom());
+  ctx->FillOpacityMask(letters, p.brush(c), &dst, nullptr);
+  ctx->SetAntialiasMode(was);
+}
+
+// Same letters, same place, new look: paper over the old ones, then paint
+// them back through their own shape in the new color.
+void Scene::repaint(Painter& p, const Palette&, const Style& st, const Entity& e, size_t line, Vec2 o, float age) {
+  const Glyphs& g = e.glyphs[line];
+  const Rect cut = off(g.at, o);
+  const float pl = std::clamp(g.room_l - 1.f, 0.f, 3.f), pr = std::clamp(g.room_r - 1.f, 0.f, 3.f);
+  const float pt = std::clamp(g.room_t * 0.5f - 0.5f, 0.f, 2.5f), pb = std::clamp(g.room_b * 0.5f - 0.5f, 0.f, 2.5f);
+  const Rect box{cut.x - pl, cut.y - pt, cut.w + pl + pr, cut.h + pt + pb};
+  if (!g.chip) p.fill(cut, hex(g.bg));  // a button or tag keeps its own color
+  if (st.fill) p.fill(box, st.fill_color);
+  if (st.outline) p.stroke(box.inflated(-0.75f), st.outline_color, 1.5f);
+  ID2D1Bitmap* bmp = letters(p, e, line);
+  if (!bmp) return;
+  float jitter = 0;
+  if (age < 0.35f) {
+    const float k = 1.f - age / 0.35f;
+    jitter = rng_.range(-2.f, 2.f) * k;
+    ink(p, bmp, cut.moved(rng_.range(-6.f, -2.f) * k, 0), with_alpha(hex(0x00F0FF), 0.6f * k));
+    ink(p, bmp, cut.moved(rng_.range(2.f, 6.f) * k, 0), with_alpha(hex(0xFF2A6D), 0.6f * k));
+  }
+  const Rect at = cut.moved(jitter, 0);
+  if (st.weight >= DWRITE_FONT_WEIGHT_SEMI_BOLD) ink(p, bmp, at.moved(0.6f, 0), st.color);  // a touch bolder
+  ink(p, bmp, at, st.color);
 }
 
 void Scene::sentence(Painter& p, const Palette& pal, const Entity& e, Vec2 o, float progress, bool live) {
@@ -135,38 +241,51 @@ void Scene::sentence(Painter& p, const Palette& pal, const Entity& e, Vec2 o, fl
   }
 }
 
-void Scene::decal(Painter& p, const Palette& pal, const Page& page, const Entity& e, Vec2 o, double now) {
+void Scene::decal(Painter& p, const Palette& pal, const Entity& e, Vec2 o, double now) {
   const Style st = style_for(e, pal);
   const float age = static_cast<float>(now - e.applied_at);
   ID2D1DeviceContext* ctx = p.ctx();
+  bool lifted = !e.lines.empty() && e.glyphs.size() == e.lines.size();
+  for (size_t i = 0; lifted && i < e.lines.size(); ++i) lifted = on_line(e.glyphs[i], e.lines[i]);
 
   if (e.lines.size() != 1) {
-    // Wrapped across lines: mark it in place, keep the original text.
-    for (const Rect& raw : e.lines) {
-      const Rect r = off(raw, o).inflated(1.5f);
+    // Wrapped across lines: keep every line where it is.
+    for (size_t i = 0; i < e.lines.size(); ++i) {
+      if (lifted) {
+        repaint(p, pal, st, e, i, o, age);
+        continue;
+      }
+      const Rect r = off(e.lines[i], o);
       p.fill(r, with_alpha(st.fill ? st.fill_color : st.color, 0.2f));
       p.stroke(r, st.outline ? st.outline_color : st.color, 1.4f);
     }
     return;
   }
 
+  const Glyphs* g = lifted ? &e.glyphs.front() : nullptr;
+  const Plan& plan = plan_for(p, e, st, g);
+  if (!plan.layout) {
+    if (g) repaint(p, pal, st, e, 0, o, age);
+    return;
+  }
+
+  // New text in the new font, on clean paper only.
   const Rect r = off(e.lines.front(), o);
-  IDWriteTextLayout* layout = layout_for(p, page, e, st);
-  if (!layout) return;
-  DWRITE_TEXT_METRICS m{};
-  layout->GetMetrics(&m);
-  const float cy = r.center().y;
+  const Rect cut = g ? off(g->at, o) : r.inflated(1.5f);
+  const D2D1_COLOR_F paper = hex(g ? g->bg : e.bg);
   const float pad = (st.fill || st.outline) ? 3.f : 0.f;
-  const float bh = std::max(r.h + 4.f, m.height);
-  const Rect box{r.x - pad, cy - bh * 0.5f, m.widthIncludingTrailingWhitespace + pad * 2, bh};
+  const float cy = cut.center().y;
+  IDWriteTextLayout* layout = plan.layout.Get();
+  const float left = g ? cut.x + std::min(pad, std::max(0.f, g->room_l - 1.f)) : r.x;
+  const Vec2 at{left - plan.ink.x, cy - plan.ink.y - plan.ink.h * 0.5f};
+  const Rect inked{left, at.y + plan.ink.y, plan.ink.w, plan.ink.h};
+  const Rect box = inked.inflated(pad);
 
-  // Paper over the original first, in place, so a tilted copy leaves a gap.
-  p.fill({r.x - 2.5f, r.y - 3.f, r.w + 5.f, r.h + 6.f}, hex(e.bg));
-
+  p.fill(cut, paper);  // the old letters go first, so a tilted copy leaves no ghost
   D2D1::Matrix3x2F xf = D2D1::Matrix3x2F::Identity();
-  if (e.tilt != 0) {
-    xf = D2D1::Matrix3x2F::Rotation(e.tilt * 180.f / kPi, {r.x, cy}) *
-         D2D1::Matrix3x2F::Translation(e.nudge.x, e.nudge.y);
+  if (plan.tilt != 0) {
+    xf = D2D1::Matrix3x2F::Rotation(plan.tilt * 180.f / kPi, {inked.x, cy}) *
+         D2D1::Matrix3x2F::Translation(plan.nudge.x, plan.nudge.y);
   }
   float jitter = 0;
   if (age < 0.35f) {
@@ -174,10 +293,8 @@ void Scene::decal(Painter& p, const Palette& pal, const Page& page, const Entity
     jitter = rng_.range(-3.f, 3.f) * k;
     ctx->SetTransform(xf);
     // Chromatic ghosts and a few torn scanlines, like the reference's glitch.
-    ctx->DrawTextLayout({r.x + rng_.range(-7.f, -2.f) * k, cy - m.height * 0.5f}, layout,
-                        p.brush(with_alpha(hex(0x00F0FF), 0.6f * k)));
-    ctx->DrawTextLayout({r.x + rng_.range(2.f, 7.f) * k, cy - m.height * 0.5f}, layout,
-                        p.brush(with_alpha(hex(0xFF2A6D), 0.6f * k)));
+    ctx->DrawTextLayout({at.x + rng_.range(-7.f, -2.f) * k, at.y}, layout, p.brush(with_alpha(hex(0x00F0FF), 0.6f * k)));
+    ctx->DrawTextLayout({at.x + rng_.range(2.f, 7.f) * k, at.y}, layout, p.brush(with_alpha(hex(0xFF2A6D), 0.6f * k)));
     const D2D1_COLOR_F bars[] = {pal.magenta, pal.green, pal.blue, pal.salmon};
     for (int i = 0; i < 4; ++i) {
       const float bw = rng_.range(12.f, 140.f);
@@ -187,9 +304,9 @@ void Scene::decal(Painter& p, const Palette& pal, const Page& page, const Entity
   }
   ctx->SetTransform(xf * D2D1::Matrix3x2F::Translation(jitter, 0));
   if (st.fill) p.fill(box, st.fill_color);
-  else p.fill(box.inflated(-pad + 0.5f), hex(e.bg));
+  else if (!g) p.fill(inked.inflated(1.f), paper);
   if (st.outline) p.stroke(box, st.outline_color, 1.5f);
-  ctx->DrawTextLayout({r.x, cy - m.height * 0.5f}, layout, p.brush(st.color));
+  ctx->DrawTextLayout({at.x, at.y}, layout, p.brush(st.color));
   ctx->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
@@ -390,7 +507,7 @@ void Scene::draw(Painter& p, const Page& page, const Pet& pet, const Settings& s
     if (e.mark != Mark::Done && !live) continue;
     if (!seen.contains(off(e.box, o).center()) && overlap_area(seen, off(e.box, o)) <= 0) continue;
     if (e.kind == Kind::Sentence) sentence(p, pal, e, o, e.read, live);
-    else decal(p, pal, page, e, o, now);
+    else decal(p, pal, e, o, now);
   }
 
   // Silk between finds, and the dragline back to the last one.
@@ -475,7 +592,8 @@ void Scene::draw(Painter& p, const Page& page, const Pet& pet, const Settings& s
              with_alpha(bars[rng_.below(5)], 0.5f * a));
     }
   }
-  if (layouts_.size() > 800) layouts_.clear();
+  if (plans_.size() > 800) plans_.clear();
+  if (masks_.size() > 600) masks_.clear();
 }
 
 }  // namespace sp

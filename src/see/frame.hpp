@@ -3,6 +3,7 @@
 #include "core/geom.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,7 @@ struct OcrPass {
   double took = 0;
   uint64_t generation = 0;  // target generation the frame belongs to
   std::vector<uint8_t> fixed;
+  std::shared_ptr<const Frame> image;  // the pixels that were read
 };
 
 }  // namespace sp

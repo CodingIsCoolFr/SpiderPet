@@ -194,6 +194,7 @@ bool TextReader::read(const Frame& frame, OcrPass& out) {
   out.h = frame.h;
   out.scroll = frame.scroll;
   out.time = frame.time;
+  out.image = std::make_shared<const Frame>(frame);
   out.took = now_seconds() - t0;
   return true;
 }

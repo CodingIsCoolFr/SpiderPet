@@ -21,6 +21,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 # Everything except the two front ends, so the simulator runs the real code.
 add_library(spidercore STATIC
   src/core/util.cpp
+  src/see/glyphs.cpp
   src/see/image.cpp
   src/see/ocr.cpp
   src/see/scroll.cpp

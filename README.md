@@ -30,6 +30,7 @@
 
 - **Walks on real text.** Eight jointed legs plant their feet on the letters under them. Scroll the page and it holds on.
 - **Lassoes what is worth keeping.** A magenta line shoots out to a find; the find glitches and changes its look — green code for DOIs, big blue code for ISBNs, salmon for titles, boxes for links.
+- **Never covers its neighbors.** It lifts the real letters out of the window's pixels and measures the clean space around them. A new font is used only where it fits in that space. Everywhere else the same letters are repainted in place, in the new color, so icons, buttons and tags stay whole.
 - **Reads like a person.** It skims each paragraph for the key sentence, works top to bottom, and scrolls the page by itself to keep going.
 - **Thinks out loud.** A thought bubble tells you what it is doing, in the voice of a small digital organism feeding on information: `doi: 10.1016/j.cub.2009.08.049`, `digesting: spiders use webs for hearing`, `crawling deeper.`
 - **Keeps everything.** The panel lists every find. Click one and the spider takes you back to it on the page. Save as JSON or CSV.

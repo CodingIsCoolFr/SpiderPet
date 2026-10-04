@@ -294,6 +294,7 @@ void Page::shift(float dy) {
   for (Entity& e : entities_) {
     e.box.y += dy;
     for (Rect& r : e.lines) r.y += dy;
+    for (Glyphs& g : e.glyphs) g.at.y += dy;
   }
 }
 
@@ -394,7 +395,65 @@ float Page::merge(const OcrPass& pass, const std::function<bool(const Rect&)>& v
   std::vector<Entity> found;
   extract(y0, y1, found);
   reconcile(found, y0, y1, visible);
+  if (pass.image) lift_glyphs(*pass.image, scroll, y0, y1, visible);
   return drift;
+}
+
+// The real letters of every find on screen, so the overlay can repaint them
+// in place instead of writing new text over the old.
+void Page::lift_glyphs(const Frame& f, float scroll, float y0, float y1,
+                       const std::function<bool(const Rect&)>& visible) {
+  for (Entity& e : entities_) {
+    if (e.kind == Kind::Sentence || e.lines.empty()) continue;
+    if (e.box.y < y0 || e.box.bottom() > y1 || (visible && !visible(e.box))) continue;
+    std::vector<Glyphs> cut(e.lines.size());
+    bool all = true;
+    for (size_t i = 0; i < e.lines.size() && all; ++i) {
+      all = cut_glyphs(f, e.lines[i].moved(0, -scroll), cut[i]);
+      cut[i].at.y += scroll;
+    }
+    // Ink outside the reader's words is an icon or a counter: the letters can
+    // be repainted, but new text must not be written over it. And new text is
+    // only written where the words read here spell the find itself.
+    for (size_t i = 0; i < cut.size() && all; ++i) {
+      Glyphs& g = cut[i];
+      std::vector<const OcrWord*> words;
+      for (const TextLine& l : lines_) {
+        if (l.box.bottom() < g.at.y || l.box.y > g.at.bottom()) continue;
+        for (const OcrWord& w : l.words)
+          if (overlap_area(w.box, g.at) > 0.5f * w.box.w * w.box.h) words.push_back(&w);
+      }
+      double ink = 0, stray = 0;
+      for (int y = 0; y < g.h; ++y)
+        for (int x = 0; x < g.w; ++x) {
+          const uint8_t a = g.a[static_cast<size_t>(y) * g.w + x];
+          if (!a) continue;
+          ink += a;
+          const Vec2 p{g.at.x + x + 0.5f, g.at.y + y + 0.5f};
+          bool in = false;
+          for (const OcrWord* w : words) in |= w->box.inflated(2.f).contains(p);
+          if (!in) stray += a;
+        }
+      g.stray = ink > 0 ? static_cast<float>(stray / ink) : 1.f;
+      auto plain = [](const std::wstring& s) {
+        std::wstring o;
+        for (wchar_t c : s)
+          if (iswalnum(c)) o += static_cast<wchar_t>(towlower(c));
+        return o;
+      };
+      std::wstring read;
+      std::vector<const OcrWord*> order = words;
+      std::sort(order.begin(), order.end(), [](const OcrWord* a, const OcrWord* b) { return a->box.x < b->box.x; });
+      for (const OcrWord* w : order) read += w->text;
+      const std::wstring a = plain(read), b = plain(e.text);
+      g.literal = !a.empty() && !b.empty() && a.front() == b.front() && a.back() == b.back() &&
+                  std::abs(static_cast<int>(a.size()) - static_cast<int>(b.size())) * 7 <= static_cast<int>(b.size());
+    }
+    // A failed cut (a tooltip over it, a busy background) keeps the last
+    // good one, if that still sits on the find.
+    if (all) e.glyphs = std::move(cut);
+    else if (!e.glyphs.empty() && iou(e.glyphs.front().at, e.lines.front()) < 0.3f) e.glyphs.clear();
+  }
 }
 
 void Page::rebuild_stats() {

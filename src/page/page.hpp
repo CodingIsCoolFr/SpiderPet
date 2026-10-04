@@ -2,6 +2,7 @@
 
 #include "core/geom.hpp"
 #include "see/frame.hpp"
+#include "see/glyphs.hpp"
 
 #include <functional>
 #include <string>
@@ -25,6 +26,7 @@ struct Entity {
   std::wstring label;          // "PMID", "ISBN" and so on for ids
   std::wstring href;           // where a link goes, when the page told us
   std::vector<Rect> lines;     // one box per text line, content coordinates
+  std::vector<Glyphs> glyphs;  // the real letters of each line, when they could be lifted
   Rect box;
   float font_px = 16;
   uint32_t fg = 0xE0E0E0;
@@ -108,6 +110,7 @@ class Page {
   std::wstring facts_text(const Rect& area) const;
   void extract_sentences(const Block& b, std::vector<Entity>& out) const;
   void reconcile(std::vector<Entity>& found, float y0, float y1, const std::function<bool(const Rect&)>& visible);
+  void lift_glyphs(const Frame& f, float scroll, float y0, float y1, const std::function<bool(const Rect&)>& visible);
   bool is_link_color(uint32_t fg) const;
 
   std::vector<TextLine> lines_;
