@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -46,7 +47,7 @@ namespace {
 constexpr UINT kTrayMsg = WM_APP + 1;
 constexpr UINT kShowMsg = WM_APP + 2;
 constexpr UINT kWakeMsg = WM_APP + 3;
-constexpr const char* kVersion = "3.1.0";
+constexpr const char* kVersion = "3.2.0";
 
 ImVec4 hexv(uint32_t c, float a = 1.f) {
   return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
@@ -97,29 +98,29 @@ bool rankable(const json& f) {
   return k == "sentence" || k == "heading" || k == "link" || k == "title";
 }
 
-// Words that would match half of any page.
+// Words that would match half of any page, and the words a question is built from.
 bool stopword(const std::string& w) {
   static const std::set<std::string> s = {
-      "the", "and", "for", "with", "about", "what", "how", "who", "why", "when", "where", "which", "that", "this",
-      "are", "was", "were", "from", "into", "its", "find", "show", "look", "looking", "info", "information", "anything",
-      "something", "page", "pages", "some", "any", "all", "more", "most", "best", "does", "did", "can", "you", "your"};
+      "the", "and", "for", "with", "about", "what", "what's", "whats", "how", "who", "who's", "why", "when", "where",
+      "which", "that", "this", "these", "those", "there", "their", "they", "them", "are", "was", "were", "is", "from",
+      "into", "its", "it's", "find", "show", "look", "looking", "info", "information", "anything", "something", "page",
+      "pages", "site", "some", "any", "all", "more", "most", "best", "does", "did", "can", "could", "would", "should",
+      "will", "you", "your", "have", "has", "had", "tell", "give", "list", "explain", "describe", "mean", "means"};
   return w.size() < 3 || s.count(w) > 0;
 }
 
 std::string lower_utf8(const std::string& s) { return utf8(lower(wide(s))); }
 
-// The search as words the spider can match right away, before the model has
-// thought of synonyms: the whole phrase, then each word that means something.
-json quick_terms(const std::string& goal) {
-  json out = json::array();
-  std::set<std::string> seen;
-  auto put = [&](const std::string& t) {
-    if (!t.empty() && seen.insert(t).second) out.push_back(t);
-  };
-  const std::string g = utf8(trim(lower(wide(goal))));
-  if (g.empty()) return out;
-  std::string word;
+// Lowercase, trimmed, with typographic apostrophes made plain ("what’s" -> "what's").
+std::string plain(const std::string& s) {
+  std::string g = utf8(trim(lower(wide(s))));
+  for (size_t at; (at = g.find("\xE2\x80\x99")) != std::string::npos;) g.replace(at, 3, "'");
+  return g;
+}
+
+std::vector<std::string> words_in(const std::string& g) {
   std::vector<std::string> words;
+  std::string word;
   for (const char c : g + " ") {
     // Letters, digits, and every byte of a non-English letter stay in the word.
     if (std::isalnum(static_cast<unsigned char>(c)) || static_cast<unsigned char>(c) >= 0x80 || c == '-' || c == '\'') {
@@ -129,9 +130,123 @@ json quick_terms(const std::string& goal) {
       word.clear();
     }
   }
-  if (words.size() > 1 && g.size() <= 60) put(g);
+  return words;
+}
+
+// What you typed: words to hunt for, a question about the page, or a request
+// for what the page is about.
+enum class Ask { None, About, Question };
+
+Ask ask_kind(const std::string& goal) {
+  const std::string g = plain(goal);
+  if (g.empty()) return Ask::None;
+  const auto has = [&](const char* s) { return g.find(s) != std::string::npos; };
+  const std::vector<std::string> w = words_in(g);
+  if (has("summar") || has("tl;dr") || has("tldr") || has("gist") || has("overview") || has("main point") || has("key point"))
+    return Ask::About;
+  if ((has("what") || has("whats")) && has("about")) return Ask::About;  // "what's this page about"
+  if (g == "what is this" || g == "what's this" || g == "whats this" || g == "explain this" || g == "explain this page" ||
+      g == "describe this page" || g == "what is this page" || g == "what's this page")
+    return Ask::About;
+  static const std::set<std::string> openers = {"what", "what's", "whats", "who", "who's", "whom", "whose", "when", "where",
+                                                "why", "how", "which", "is", "are", "was", "were", "does", "do", "did",
+                                                "can", "could", "should", "will", "would", "explain", "tell", "describe",
+                                                "list", "has", "have"};
+  if (g.back() == '?' || (w.size() >= 3 && openers.count(w.front()))) return Ask::Question;
+  return Ask::None;
+}
+
+// The search as words the spider can match right away, before the model has
+// thought of synonyms: the whole phrase, then each word that means something.
+// A question's own wording is never on the page, so only its words count.
+json quick_terms(const std::string& goal) {
+  json out = json::array();
+  std::set<std::string> seen;
+  auto put = [&](const std::string& t) {
+    if (!t.empty() && seen.insert(t).second) out.push_back(t);
+  };
+  const std::string g = plain(goal);
+  if (g.empty()) return out;
+  const Ask kind = ask_kind(goal);
+  if (kind == Ask::About) return out;  // nothing to hunt: the spider reads the page
+  const std::vector<std::string> words = words_in(g);
+  if (kind == Ask::None && words.size() > 1 && g.size() <= 60) put(g);
   for (const std::string& w : words)
-    if (!stopword(w) || words.size() == 1) put(w);
+    if (!stopword(w) || (words.size() == 1 && kind == Ask::None)) put(w);
+  return out;
+}
+
+// The page's own sentences, for a quick answer when the AI cannot run.
+std::vector<std::string> sentences_of(const std::string& text) {
+  std::vector<std::string> out;
+  std::string cur;
+  auto flush = [&] {
+    std::string s = utf8(trim(wide(cur)));
+    cur.clear();
+    if (s.size() < 40 || s.size() > 400 || words_in(s).size() < 6) return;
+    const std::string l = plain(s);
+    for (const char* junk : {"cookie", "sign in", "log in", "sign up", "subscribe", "privacy", "terms of", "javascript"})
+      if (l.find(junk) != std::string::npos) return;
+    // Notes about the page rather than its content ("For other uses, see...").
+    for (const char* note : {"for other uses", "this article is about", "not to be confused", "redirects here", "see also",
+                             "jump to", "from wikipedia"})
+      if (l.rfind(note, 0) == 0 || l.find(std::string("\"") + note) == 0) return;
+    out.push_back(s);
+  };
+  for (size_t i = 0; i < text.size(); ++i) {
+    const char c = text[i];
+    if (c == '\n') {
+      flush();
+      continue;
+    }
+    cur += c;
+    if ((c == '.' || c == '!' || c == '?') && (i + 1 == text.size() || text[i + 1] == ' ' || text[i + 1] == '\n')) flush();
+  }
+  flush();
+  return out;
+}
+
+// A quick answer from the page itself: its own description and its leading
+// sentences for "what is it about", the sentences sharing the most words with
+// a question otherwise.
+std::string quick_answer(Ask kind, const std::string& goal, const std::string& title, const std::string& desc,
+                         const std::string& text) {
+  const std::vector<std::string> sents = sentences_of(text);
+  if (kind == Ask::About) {
+    std::string out = title.empty() ? "" : "\"" + title + "\". ";
+    if (desc.size() >= 40) return out + desc;
+    for (size_t i = 0; i < sents.size() && i < 2; ++i) out += sents[i] + " ";
+    return out.empty() ? "The page has too little text to say." : out;
+  }
+  // The question's words, cut to their stem ("spiders" finds "spider", "eat" finds "eaten" but not "breathe").
+  std::vector<std::string> want;
+  for (const std::string& w : words_in(plain(goal)))
+    if (!stopword(w)) want.push_back(w.size() > 5 ? w.substr(0, 5) : w);
+  std::vector<std::vector<bool>> has(sents.size(), std::vector<bool>(want.size(), false));
+  std::vector<int> df(want.size(), 0);
+  for (size_t i = 0; i < sents.size(); ++i) {
+    const std::vector<std::string> ws = words_in(plain(sents[i]));
+    for (size_t k = 0; k < want.size(); ++k) {
+      for (const std::string& w : ws)
+        if (w.rfind(want[k], 0) == 0) {
+          has[i][k] = true;
+          ++df[k];
+          break;
+        }
+    }
+  }
+  // A word every sentence has (the page's own subject) says little; a rare one says a lot.
+  std::vector<std::pair<double, size_t>> scored;
+  for (size_t i = 0; i < sents.size(); ++i) {
+    double s = 0;
+    for (size_t k = 0; k < want.size(); ++k)
+      if (has[i][k]) s += 1.0 / (1.0 + std::log(1.0 + df[k]));
+    if (s > 0) scored.push_back({s, i});
+  }
+  std::stable_sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  if (scored.empty()) return "The page does not seem to say.";
+  std::string out;
+  for (size_t k = 0; k < scored.size() && k < 2; ++k) out += sents[scored[k].second] + " ";
   return out;
 }
 
@@ -199,11 +314,14 @@ class App {
   void apply_settings(const json& partial);
   void reveal(const std::string& url, const std::string& id);
   void commit_goal(const std::string& goal, bool force);
+  void forget_page(const std::string& url);  // called with mu_ held
+  void forget_all();                         // called with mu_ held
+  bool confirm(const char* label, const char* again, const std::string& id);
   void send_spider(bool on);
   int matches(const json& f) const;
 
   struct Job {
-    enum Type { Check, Rank, Gist, Expand } type;
+    enum Type { Check, Rank, Gist, Expand, Answer, Blockers } type;
     std::string url, id;
     json data;
   };
@@ -245,6 +363,17 @@ class App {
   std::string active_url_;               // the page "This page" shows: the tab you are on
   json terms_ = json::array();           // the search as words to match: yours first, then the model's
   int goal_seq_ = 0;                     // bumps with every search, so a late model answer is dropped
+  // The answer to what you asked (a question, or what the page is about).
+  struct Reply {
+    std::string goal, url, text, quote;
+    bool busy = false;
+    bool by_ai = false;
+  } reply_;
+  struct PageText {
+    std::string title, desc, text;
+  };
+  std::map<std::string, PageText> texts_;  // the words of recent pages, for answers
+  void queue_answer();                     // called with mu_ held
   json status_ = {{"ollama", false}, {"model", ""}};
   std::string busy_;                     // what the worker is doing
   std::deque<Job> urgent_, jobs_;
@@ -268,6 +397,8 @@ class App {
   bool focus_goal_ = false;  // the window just opened: the search box takes the keyboard
   std::optional<std::string> pending_goal_;
   std::optional<bool> pending_spider_;
+  std::string armed_;        // the forget button that was clicked once and waits for the second click
+  double armed_at_ = -100;
 };
 
 int App::run(HINSTANCE inst, bool tray) {
@@ -385,6 +516,11 @@ void App::on_message(int client, const json& m) {
     b.spider = m.value("spider", false);
     b.at = now_seconds();
     if (b.web && !b.url.empty()) active_url_ = b.url;
+    // A question follows you to the next page: it is about the page you are on.
+    if (!reply_.goal.empty() && b.web && !b.url.empty() && b.url != reply_.url) {
+      reply_ = {reply_.goal, b.url, "", "", true, false};
+      queue_answer();
+    }
     wake();
     return;
   }
@@ -394,11 +530,23 @@ void App::on_message(int client, const json& m) {
     wake();
     return;
   }
+  if (type == "blockers") {
+    // Something floats over a page and the spider can't tell if it is a popup: the AI decides, first in line.
+    urgent_.push_front({Job::Blockers, jstr(m, "url"), "", {{"client", client}, {"items", m.value("items", json::array())}}});
+    cv_.notify_all();
+    return;
+  }
   if (type == "page") {
     const std::string url = jstr(m, "url");
     if (url.empty()) return;
     if (!current()) active_url_ = url;  // a browser that does not say which tab you are on
     lib_.touch_page(url, jstr(m, "title"), jstr(m, "lang"));
+    if (texts_.size() > 40) texts_.erase(texts_.begin());
+    texts_[url] = {jstr(m, "title"), jstr(m, "desc"), jstr(m, "text")};
+    if (!reply_.goal.empty() && (reply_.url == url || reply_.url.empty()) && reply_.text.empty()) {
+      reply_.url = url;
+      queue_answer();
+    }
     const json* p = lib_.page(url);
     const bool has_gist = p && p->contains("gist") && (*p)["gist"].is_object() && !(*p)["gist"].contains("error");
     if (has_gist) {
@@ -572,6 +720,8 @@ void App::worker() {
       // needs no model goes on (ids and titles are looked up and compared by words).
       const bool gpu_busy = checker_.gpu_busy();
       auto needs_model = [&](const Job& j) {
+        // Without the model these still answer: from the page's own sentences, or by the spider's rules.
+        if (j.type == Job::Answer || j.type == Job::Blockers) return false;
         if (j.type != Job::Check) return true;
         const json* f = lib_.find(j.id);
         return f && jstr(*f, "kind") == "sentence";
@@ -686,6 +836,70 @@ void App::worker() {
         }
       }
       if (terms.is_array()) bridge_.broadcast({{"type", "goal"}, {"goal", goal}, {"terms", terms}});
+    } else if (job.type == Job::Answer) {
+      const std::string goal = jstr(job.data, "goal");
+      const Ask kind = ask_kind(goal);
+      PageText page;
+      json gist;
+      {
+        std::lock_guard lock(mu_);
+        if (reply_.goal != goal || reply_.url != job.url || !texts_.count(job.url)) continue;  // you asked something else since
+        page = texts_[job.url];
+        if (const json* p = lib_.page(job.url); p && p->contains("gist") && (*p)["gist"].is_object() && !(*p)["gist"].contains("error"))
+          gist = (*p)["gist"];
+        busy_ = "answering: " + goal.substr(0, 60);
+      }
+      wake();
+      std::string text, quote;
+      bool by_ai = false;
+      if (kind == Ask::About) {
+        // What the page is about: its summary, made now if there is none yet.
+        if (!gist.is_object()) {
+          const json g = checker_.gist(page.title, job.url, page.text);
+          if (!g.contains("error")) {
+            gist = g;
+            std::lock_guard lock(mu_);
+            lib_.set_gist(job.url, g);
+          }
+        }
+        if (gist.is_object()) {
+          by_ai = true;
+          text = jstr(gist, "summary");
+          if (gist.contains("points") && gist["points"].is_array())
+            for (const json& pt : gist["points"])
+              if (pt.is_string()) text += "\n- " + pt.get<std::string>();
+          bridge_.broadcast({{"type", "gist"}, {"url", job.url}, {"gist", gist}});
+        }
+      } else {
+        const json a = checker_.answer(goal, page.title, page.text);
+        if (a.is_object() && !jstr(a, "answer").empty()) {
+          by_ai = true;
+          text = jstr(a, "answer");
+          quote = jstr(a, "quote");
+        }
+      }
+      if (text.empty()) text = quick_answer(kind, goal, page.title, page.desc, page.text);  // the AI is paused or off
+      {
+        std::lock_guard lock(mu_);
+        busy_.clear();
+        if (reply_.goal == goal && reply_.url == job.url) reply_ = {goal, job.url, text, quote, false, by_ai};
+      }
+      bridge_.broadcast({{"type", "answer"}, {"url", job.url}, {"goal", goal}, {"text", text}});
+    } else if (job.type == Job::Blockers) {
+      {
+        std::lock_guard lock(mu_);
+        busy_ = "looking at a popup";
+      }
+      wake();
+      const json d = checker_.blockers(job.data.value("items", json::array()));
+      {
+        std::lock_guard lock(mu_);
+        busy_.clear();
+      }
+      json reply = {{"type", "blockers"}, {"url", job.url}};
+      if (d.is_object()) reply["decisions"] = d;
+      else reply["fallback"] = true;  // no AI now: the spider's own rules decide
+      bridge_.send(job.data.value("client", -1), reply);
     }
     wake();
   }
@@ -701,11 +915,12 @@ void App::commit_goal(const std::string& goal, bool force) {
   {
     std::lock_guard lock(mu_);
     if (goal == settings_.goal && !force) return;
+    const Ask kind = ask_kind(goal);
     terms_ = quick_terms(goal);
     terms = terms_;
     ++goal_seq_;
-    std::erase_if(urgent_, [](const Job& j) { return j.type == Job::Expand; });
-    if (!goal.empty()) {
+    std::erase_if(urgent_, [](const Job& j) { return j.type == Job::Expand || j.type == Job::Answer; });
+    if (!goal.empty() && kind == Ask::None) {
       urgent_.push_front({Job::Expand, "", "", {{"goal", goal}, {"seq", goal_seq_}}});
       cv_.notify_all();
     }
@@ -713,6 +928,12 @@ void App::commit_goal(const std::string& goal, bool force) {
     if (!goal.empty() && (!b || !b->web)) {
       notice_ = b ? "Open a web page in your browser: the spider can't go on this one." : "No browser is connected.";
       notice_at_ = now_seconds();
+    }
+    // A question gets an answer, from the page you are on.
+    reply_ = {};
+    if (kind != Ask::None) {
+      reply_ = {goal, b && b->web ? b->url : active_url_, "", "", true, false};
+      queue_answer();
     }
   }
   apply_settings({{"goal", goal}});  // saved, and the page is ranked against it
@@ -724,6 +945,51 @@ void App::commit_goal(const std::string& goal, bool force) {
     for (const auto& [c, b] : browsers_) all.push_back(c);
   }
   for (int c : all) bridge_.send(c, c == client && !goal.empty() ? hunt : words);
+}
+
+void App::queue_answer() {
+  if (reply_.goal.empty() || reply_.url.empty() || !texts_.count(reply_.url)) return;  // waits for the page's words
+  std::erase_if(urgent_, [](const Job& j) { return j.type == Job::Answer; });
+  urgent_.push_front({Job::Answer, reply_.url, "", {{"goal", reply_.goal}}});
+  cv_.notify_all();
+}
+
+void App::forget_page(const std::string& url) {
+  for (const std::string& id : lib_.finds_of(url)) queued_.erase(id);
+  std::erase_if(urgent_, [&](const Job& j) { return j.url == url; });
+  lib_.remove_page(url);
+  notice_ = "Forgot that page.";
+  notice_at_ = now_seconds();
+}
+
+// Everything it has harvested and every answer it remembers. Settings stay.
+void App::forget_all() {
+  lib_.clear();
+  std::erase_if(urgent_, [](const Job& j) { return j.type != Job::Expand; });
+  jobs_.clear();
+  queued_.clear();
+  checker_.forget();
+  notice_ = "Forgot everything: the library and the remembered checks.";
+  notice_at_ = now_seconds();
+}
+
+// A button that has to be clicked twice, so nothing is lost by a slip.
+bool App::confirm(const char* label, const char* again, const std::string& id) {
+  const bool armed = armed_ == id && now_seconds() - armed_at_ < 3;
+  if (armed) {
+    ImGui::PushStyleColor(ImGuiCol_Button, hexv(0x8A2B33));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hexv(0xA3333D));
+  }
+  const bool clicked = ImGui::SmallButton((std::string(armed ? again : label) + "##" + id).c_str());
+  if (armed) ImGui::PopStyleColor(2);
+  if (!clicked) return false;
+  if (armed) {
+    armed_.clear();
+    return true;
+  }
+  armed_ = id;
+  armed_at_ = now_seconds();
+  return false;
 }
 
 void App::send_spider(bool on) {
@@ -786,14 +1052,28 @@ bool App::create_window(HINSTANCE inst, bool show_now) {
   ImGui::SetCurrentContext(imgui_);
   ImGuiIO& io = ImGui::GetIO();
   io.IniFilename = nullptr;
-  ImFontConfig cfg;
-  cfg.OversampleH = 2;
-  // Latin, Greek, Cyrillic and general punctuation: titles and names in other scripts.
-  static const ImWchar ranges[] = {0x0020, 0x024F, 0x0370, 0x03FF, 0x0400, 0x04FF, 0x2000, 0x206F, 0x2190, 0x21FF, 0};
-  body_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.f * scale_, &cfg, ranges);
-  bold_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 16.f * scale_, &cfg, ranges);
-  title_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 24.f * scale_, &cfg, ranges);
-  small_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 13.5f * scale_, &cfg, ranges);
+  // Segoe UI first; Windows' own fonts fill in every other script and emoji
+  // (Japanese, Chinese, Korean, Indian scripts, symbols). Letters are loaded
+  // only when a page needs them, so the extra fonts cost nothing up front.
+  auto add = [&](const char* main, float size) -> ImFont* {
+    ImFontConfig cfg;
+    cfg.OversampleH = 2;
+    ImFont* f = io.Fonts->AddFontFromFileTTF(main, size, &cfg);
+    if (!f) return nullptr;
+    for (const char* extra : {"C:\\Windows\\Fonts\\YuGothM.ttc", "C:\\Windows\\Fonts\\msyh.ttc", "C:\\Windows\\Fonts\\malgun.ttf",
+                              "C:\\Windows\\Fonts\\Nirmala.ttc", "C:\\Windows\\Fonts\\seguisym.ttf",
+                              "C:\\Windows\\Fonts\\seguiemj.ttf"}) {
+      if (GetFileAttributesA(extra) == INVALID_FILE_ATTRIBUTES) continue;
+      ImFontConfig more;
+      more.MergeMode = true;
+      io.Fonts->AddFontFromFileTTF(extra, size, &more);
+    }
+    return f;
+  };
+  body_ = add("C:\\Windows\\Fonts\\segoeui.ttf", 16.f * scale_);
+  bold_ = add("C:\\Windows\\Fonts\\seguisb.ttf", 16.f * scale_);
+  title_ = add("C:\\Windows\\Fonts\\segoeuib.ttf", 24.f * scale_);
+  small_ = add("C:\\Windows\\Fonts\\segoeui.ttf", 13.5f * scale_);
   if (!body_) body_ = io.Fonts->AddFontDefault();
   if (!bold_) bold_ = body_;
   if (!title_) title_ = body_;
@@ -1079,7 +1359,9 @@ void App::draw_header() {
     goal_dirty_ = true;
     goal_edit_at_ = now_seconds();
   }
-  if (enter || (goal_dirty_ && now_seconds() - goal_edit_at_ > 0.7)) {
+  // Words are hunted while you type; a question waits until you stop, so half a question is not answered.
+  const double pause = ask_kind(goal_) == Ask::None ? 0.7 : 1.6;
+  if (enter || (goal_dirty_ && now_seconds() - goal_edit_at_ > pause)) {
     goal_dirty_ = false;
     goal_force_ = enter;
     pending_goal_ = std::string(goal_);  // sent after this frame, outside the lock
@@ -1209,10 +1491,38 @@ void App::draw_page() {
   ImGui::TextWrapped("%s", jstr(*p, "title").c_str());
   ImGui::PopFont();
   ImGui::PushFont(small_, small_->LegacySize);
-  ImGui::TextColored(hexv(0x7D8BFF), "%s", active_url_.substr(0, 110).c_str());
+  ImGui::TextColored(hexv(0x7D8BFF), "%s", active_url_.substr(0, 90).c_str());
   if (ImGui::IsItemClicked()) open_url(active_url_);
+  ImGui::SameLine();
+  if (confirm("Forget this page", "Click again: forget it", "page:" + active_url_)) {
+    forget_page(active_url_);
+    ImGui::PopFont();
+    return;
+  }
   ImGui::PopFont();
-  if (p->contains("gist") && (*p)["gist"].is_object() && !(*p)["gist"].contains("error")) {
+  // The answer to what you asked, first.
+  const bool asked = !reply_.goal.empty() && reply_.url == active_url_;
+  if (asked) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, hexv(0x1D1630));
+    ImGui::BeginChild("##answer", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushFont(small_, small_->LegacySize);
+    ImGui::TextColored(hexv(0xE64CF2), "%s", reply_.goal.c_str());
+    ImGui::PopFont();
+    if (reply_.busy) {
+      ImGui::TextDisabled("Reading the page...");
+    } else {
+      ImGui::TextWrapped("%s", reply_.text.c_str());
+      ImGui::PushFont(small_, small_->LegacySize);
+      if (!reply_.quote.empty()) ImGui::TextColored(hexv(0xB9C0D8), "from the page: \"%s\"", reply_.quote.c_str());
+      ImGui::TextDisabled(reply_.by_ai ? "answered by your local AI, from this page only"
+                                       : "a quick answer from the page's own sentences (the AI is paused or off)");
+      ImGui::PopFont();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+  }
+  const bool about = asked && ask_kind(reply_.goal) == Ask::About;  // the answer already is the summary
+  if (!about && p->contains("gist") && (*p)["gist"].is_object() && !(*p)["gist"].contains("error")) {
     const json& g = (*p)["gist"];
     ImGui::BeginChild("##gist", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(small_, small_->LegacySize);
@@ -1255,12 +1565,19 @@ void App::draw_page() {
 }
 
 void App::draw_library() {
-  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
   ImGui::InputTextWithHint("##search", "Search the library", search_, sizeof(search_));
   ImGui::SameLine();
-  ImGui::SetNextItemWidth(-1);
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
   const char* filters[] = {"All", "Verified", "Problems", "Unclear", "Not checked"};
   ImGui::Combo("##status", &status_filter_, filters, 5);
+  ImGui::SameLine();
+  ImGui::AlignTextToFramePadding();
+  if (confirm("Forget everything", "Click again: forget all", "all")) forget_all();
+  ImGui::PushFont(small_, small_->LegacySize);
+  ImGui::TextDisabled("%zu pages, %zu finds. Forget clears the finds and the remembered checks; settings stay.",
+                      lib_.page_order().size(), lib_.finds().size());
+  ImGui::PopFont();
   const std::string q = lower(wide(search_)).empty() ? "" : utf8(lower(wide(search_)));
 
   ImGui::BeginChild("##lib", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
@@ -1284,16 +1601,17 @@ void App::draw_library() {
     if (list.empty()) continue;
     shown += static_cast<int>(list.size());
     const std::string head = (jstr(*p, "title").empty() ? url : jstr(*p, "title")) + "  (" + std::to_string(list.size()) + ")##" + url;
-    if (ImGui::CollapsingHeader(head.c_str(), url == active_url_ ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
-      for (const json* f : list) draw_find(*f, false);
-      ImGui::PushFont(small_, small_->LegacySize);
-      if (ImGui::SmallButton(("Remove this page##" + url).c_str())) {
-        lib_.remove_page(url);
-        ImGui::PopFont();
-        break;
-      }
-      ImGui::PopFont();
+    const bool open = ImGui::CollapsingHeader(
+        head.c_str(), ImGuiTreeNodeFlags_AllowOverlap | (url == active_url_ ? ImGuiTreeNodeFlags_DefaultOpen : 0));
+    // A forget button on every page's row, at the right.
+    const float bw = ImGui::CalcTextSize("Click again: forget").x + ImGui::GetStyle().FramePadding.x * 2;
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - bw);
+    if (confirm("Forget", "Click again: forget", url)) {
+      forget_page(url);
+      break;
     }
+    if (open)
+      for (const json* f : list) draw_find(*f, false);
   }
   if (shown == 0) ImGui::TextDisabled("Nothing here yet.");
   ImGui::EndChild();
@@ -1313,6 +1631,13 @@ void App::draw_settings() {
   changed |= ImGui::Checkbox("Check every find as it is harvested", &s.auto_check);
   changed |= ImGui::Checkbox("Check claims in sentences the spider reads or that match your search (slower)", &s.check_sentences);
   changed |= ImGui::Checkbox("Let the spider scroll pages by itself", &s.crawl);
+  changed |= ImGui::Checkbox("Tuck away popups, cookie banners and sign-up walls that block the page", &s.popups);
+  ImGui::PushFont(small_, small_->LegacySize);
+  ImGui::Indent();
+  ImGui::TextWrapped("The spider hides them; it never clicks Accept or anything else. Unclear ones go to the local AI. "
+                     "Stop the spider and they come back.");
+  ImGui::Unindent();
+  ImGui::PopFont();
 
   ImGui::Spacing();
   ImGui::TextUnformatted("Model");
@@ -1343,15 +1668,9 @@ void App::draw_settings() {
   ImGui::SameLine();
   if (ImGui::Button("Open folder")) open_path(documents_dir());
   ImGui::Spacing();
-  static double armed = 0;
-  if (ImGui::Button(now_seconds() - armed < 3 ? "Click again to clear everything" : "Clear library")) {
-    if (now_seconds() - armed < 3) {
-      lib_.clear();
-      armed = 0;
-    } else {
-      armed = now_seconds();
-    }
-  }
+  if (confirm("Forget everything", "Click again: forget all", "settings-all")) forget_all();
+  ImGui::SameLine();
+  ImGui::TextDisabled("the library and the remembered checks; settings stay");
 }
 
 void App::draw_setup() {
@@ -1410,7 +1729,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   LocalFree(argv);
 
   // One app per user: a second start just brings the window up.
-  HANDLE once = CreateMutexW(nullptr, TRUE, L"Local\\SpiderPet.App");
+  HANDLE once = CreateMutexW(nullptr, TRUE, _wgetenv(L"SPIDERPET_DATA") ? L"Local\\SpiderPet.App.test" : L"Local\\SpiderPet.App");
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
     if (!tray)
       if (HWND w = FindWindowW(L"SpiderPetApp", nullptr)) PostMessageW(w, WM_APP + 2, 0, 0);

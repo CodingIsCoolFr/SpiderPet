@@ -96,6 +96,9 @@
 ::highlight(spiderpet-goal) { background-color: rgba(255, 196, 107, 0.55); color: #1E120C; }
 :root[data-spiderpet-dark]::highlight(spiderpet-reading) { background-color: rgba(125, 139, 255, 0.18); text-decoration-color: rgba(125, 139, 255, 0.95); }
 
+/* A popup, cookie banner or sign-up wall the spider tucked out of the way. */
+.spiderpet-tucked { display: none !important; }
+
 /* The glitch when the spider bites. */
 .spiderpet-glitch { animation: spiderpet-glitch .5s steps(2, end) 1; }
 @keyframes spiderpet-glitch {

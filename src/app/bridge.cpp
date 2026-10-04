@@ -2,6 +2,7 @@
 
 #include "core/util.hpp"
 
+#include <cstdlib>
 #include <fstream>
 
 namespace sp {
@@ -12,7 +13,9 @@ std::wstring pipe_name() {
   wchar_t user[256] = L"user";
   DWORD n = 256;
   GetUserNameW(user, &n);
-  return std::wstring(L"\\\\.\\pipe\\SpiderPet-") + user;
+  // A test copy (SPIDERPET_DATA set; the browser it starts passes it on to
+  // SpiderHost) gets its own line, so it never meets the real app.
+  return std::wstring(L"\\\\.\\pipe\\SpiderPet-") + user + (_wgetenv(L"SPIDERPET_DATA") ? L"-test" : L"");
 }
 
 namespace {

@@ -13,6 +13,7 @@ struct Settings {
   bool auto_check = true;      // check every find as it is harvested
   bool check_sentences = true; // also check claims (slower: two model calls each)
   bool crawl = true;           // the spider may scroll the page by itself
+  bool popups = true;          // tuck away popups, cookie banners and sign-up walls that block the page
   std::string model;           // empty = best installed
 
   nlohmann::json to_json() const;

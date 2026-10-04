@@ -25,11 +25,14 @@
 
 - **Reads the real page.** It runs inside the browser and reads the page itself, so every DOI, title and sentence is spelled exactly as written. Nothing is guessed from pixels. Hidden text, menus, cookie banners and ads are left out.
 - **Hunts for what you ask.** Type what you are looking for in the SpiderPet app. The spider drops onto the page you have open, every match on the page lights up at once, and it goes from match to match down the page. The local AI adds synonyms a moment later.
+- **Answers questions about the page.** Type a question instead, like *what's this page about?* or *what do spiders eat?*, and the app answers it from the page you have open, quoting the page. When the AI can't run, you still get a quick answer built from the page's own sentences.
+- **Gets past popups.** Cookie banners, sign-up walls, newsletter popups and dark backdrops that cover the page are tucked out of sight, and a locked page can scroll again. Unclear cases go to your local AI. The spider never clicks Accept or anything else; stop it and everything comes back.
 - **Walks like a spider.** Eight jointed legs, a magenta lasso, bursts of speed, a thought cloud with its name, silk between the things it ate. Without a search it reads the key sentences of the page with a sweep and scrolls by itself.
 - **One control center.** Everything is in the SpiderPet app: the search, Start/Stop spider, what it found on the page you are looking at, and the library. The browser needs no menus.
 - **Restyles the real text.** Like the clip that inspired it: DOIs turn into green code, ISBNs into big blue code, ids into tags, titles into salmon serif, links get a frame. The page itself changes; nothing is painted over it.
 - **Checks everything.** Each find gets a badge in the page: **✓ verified**, **⚠ wrong**, **✗ not found**, **? unclear**, **opinion** or **ad**. Hover for the reason and the source; click to open the source.
-- **Keeps a library.** The SpiderPet app keeps every find from every browser, with its check, its source and the page it came from. Search it, filter it, save it as JSON or CSV.
+- **Keeps a library.** The SpiderPet app keeps every find from every browser, with its check, its source and the page it came from. Search it, filter it, save it as JSON or CSV. **Forget** buttons clear one page or everything, including the remembered checks.
+- **Reads any site and any language.** Sites built without paragraphs (X, Reddit, Pinterest) are read too, and the app shows Japanese, Chinese, Korean, Indian scripts and emoji.
 - **Stays out of the way.** It draws at most 60 frames a second and re-reads a page only when the page really changed. Before it loads the AI it checks free graphics memory: when a game or VRChat has taken it, the AI waits instead of making your PC stutter, and ids and titles are still checked online.
 
 ## How the checking works

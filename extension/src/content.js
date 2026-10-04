@@ -94,7 +94,7 @@
     '[role=navigation], [role=banner], [role=contentinfo], [role=complementary], [role=search], [role=dialog], [aria-hidden=true], ' +
     '.navbox, .vertical-navbox, .sidebar, .mw-editsection, .toc, #toc, .mw-jump-link, .hatnote, .metadata, .noprint, .catlinks, ' +
     '[class*=cookie], [id*=cookie], [class*=consent], [class*=newsletter], [class*=advert], [class*=sponsor], [class*=promo], ' +
-    '[id^=ad-], [class^=ad-], .ad, .ads, .share, [class*=social], .spiderpet-badge, #spiderpet-host';
+    '[id^=ad-], [class^=ad-], .ad, .ads, .share, [class*=social], [data-testid=sidebarColumn], .spiderpet-badge, #spiderpet-host';
   let skipMemo = new WeakMap();
   function skipped(el) {
     if (!el || el.nodeType !== 1) return false;
@@ -252,6 +252,7 @@
       if (!el) {
         const tw = document.createTreeWalker(c, NodeFilter.SHOW_TEXT);
         for (let n = tw.nextNode(); n; n = tw.nextNode()) {
+          if (skipped(n.parentElement)) continue; // the page's own styling code sits in some citations
           const m = n.nodeValue.match(/["“]([^"”]{10,250})["”]/);
           if (!m) continue;
           const range = document.createRange();
@@ -279,11 +280,27 @@
     const seg = typeof Intl.Segmenter === 'function' ? new Intl.Segmenter(document.documentElement.lang || 'en', { granularity: 'sentence' }) : null;
     const sentences = [];
     let pIndex = 0;
-    for (const p of root.querySelectorAll(terms.length ? 'p, li, dd, td, blockquote' : 'p')) {
+    const blocks = [...root.querySelectorAll(terms.length ? 'p, li, dd, td, blockquote' : 'p')];
+    // Sites built from boxes instead of paragraphs (X, Reddit, Pinterest):
+    // the box right around each piece of text is its paragraph.
+    const loose = new Set();
+    if (blocks.filter((p) => (p.textContent || '').length >= 100).length < 4) {
+      const known = new Set(blocks);
+      const tw = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      let looked = 0;
+      for (let n = tw.nextNode(); n && loose.size < 150 && looked < 6000; n = tw.nextNode(), looked++) {
+        if (n.nodeValue.trim().length < 12) continue;
+        const box = n.parentElement?.closest('[data-testid=tweetText], p, li, dd, td, blockquote, div, article, section');
+        if (box && !known.has(box)) loose.add(box);
+      }
+      for (const b of loose) blocks.push(b);
+    }
+    for (const p of blocks) {
       if (skipped(p) || p.closest('cite, .references, .reflist') || (!terms.length && p.closest('table, blockquote'))) continue;
-      if (terms.length && p.tagName !== 'P' && p.querySelector('p, li')) continue; // its children are read instead
+      if (terms.length && p.tagName !== 'P' && !loose.has(p) && p.querySelector('p, li')) continue; // its children are read instead
+      const isLoose = loose.has(p);
       const rawAll = p.textContent || '';
-      if (rawAll.trim().length < (terms.length ? 30 : 100) || !shown(p)) continue;
+      if (rawAll.trim().length < (terms.length ? 30 : isLoose ? 40 : 100) || !shown(p)) continue;
       const nodes = [];
       let raw = '';
       const tw = document.createTreeWalker(p, NodeFilter.SHOW_TEXT);
@@ -299,7 +316,7 @@
         const lt = text.toLowerCase();
         const match = hits(text);
         if (text.length < (match ? 20 : 40) || text.length > 420) return;
-        if (!match && !/[.!?]["”')\]]*$/.test(text)) return;
+        if (!match && !isLoose && !/[.!?]["”')\]]*$/.test(text)) return; // posts often end without a full stop
         let s = text.length >= 60 && text.length <= 260 ? 1 : 0.35;
         if (i === 0) s += 0.7;
         let th = 0;
@@ -317,7 +334,7 @@
       cands.sort((a, b) => b.s - a.s);
       const keep = raw.length > 900 ? 3 : raw.length > 450 ? 2 : 1;
       cands.forEach((c, i) => {
-        if (!(c.match || (i < keep && c.s >= 0.9 && p.tagName === 'P'))) return;
+        if (!(c.match || (i < keep && c.s >= 0.9 && (p.tagName === 'P' || isLoose)))) return;
         const range = rangeFor(nodes, c.startAt, c.endAt);
         if (range) sentences.push({ kind: 'sentence', text: c.text, range, el: p, key: c.s >= 2.2, score0: c.s + (pIndex < 3 ? 0.4 : 0) });
       });
@@ -706,10 +723,13 @@
   const label = { name: null, bubble: null, goal: null };
   let thought = '';
   let thoughtAt = -100;
-  function think(text) {
+  let holdUntil = -100; // an answer stays up this long before small talk replaces it
+  function think(text, hold = 0) {
     if (!text || text === thought) return;
+    if (!hold && now() < holdUntil) return;
     thought = text;
     thoughtAt = now();
+    if (hold) holdUntil = thoughtAt + hold;
   }
 
   function wrapText(text, maxW) {
@@ -1097,6 +1117,140 @@
     ownChanges();
   }
 
+  // ------------------------------------------------------------------ popups
+
+  // Cookie banners, sign-up walls, newsletter popups and ads that float over
+  // the page and lock its scrolling. The spider never clicks them (that could
+  // accept terms for you): it tucks them out of sight and unlocks the page.
+  // Clear cases go at once; unclear ones are shown to your local AI, which
+  // decides; without the AI, careful rules decide.
+  const tucked = new Set(); // what the spider hid
+  const judged = new WeakSet(); // decided already: never asked twice
+  const pendingBlockers = new Map(); // key -> element, waiting for the AI
+  const unlocked = []; // [element, style text before]
+  let blockerKey = 0;
+  let blockersAt = -100;
+  const POPUP_WORDS =
+    /cookie|consent|gdpr|we value your privacy|subscribe|newsletter|sign ?up|sign ?in|log ?in|create (an |your )?account|join (now|free|today)|get the app|install (the )?app|open (in|the) app|advert|sponsored|ad ?block|allow notifications|turn on notifications|continue reading|before you continue|\d+ ?% off|today only|limited time|special offer|start (your )?free trial|go premium|upgrade (now|to)/i;
+
+  // The outermost box pinned to the screen that this element sits in.
+  function floatingBox(el) {
+    let top = null;
+    for (let e = el; e && e !== document.body && e !== document.documentElement; e = e.parentElement)
+      if (e !== host && getComputedStyle(e).position === 'fixed') top = e;
+    return top;
+  }
+
+  function coverOf(el) {
+    const r = el.getBoundingClientRect();
+    const w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+    const h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+    return (w * h) / (innerWidth * innerHeight);
+  }
+
+  function tuck(el) {
+    if (tucked.has(el)) return;
+    tucked.add(el);
+    judged.add(el);
+    el.classList.add('spiderpet-tucked');
+    ownChanges();
+    unlockScroll();
+    think(pick(['popup in the way. tucked it away.', 'chewed through a popup.', 'cleared the web in front of me.']));
+  }
+
+  // Pages lock scrolling while a popup is open; with the popup gone the lock stays. Lift it.
+  function unlockScroll() {
+    for (const el of [document.documentElement, document.body]) {
+      const cs = getComputedStyle(el);
+      const locked = /hidden|clip/.test(cs.overflowY) || /hidden|clip/.test(cs.overflow);
+      const pinned = el === document.body && cs.position === 'fixed';
+      if (!locked && !pinned) continue;
+      unlocked.push([el, el.getAttribute('style')]);
+      if (locked) el.style.setProperty('overflow-y', 'auto', 'important');
+      if (pinned) {
+        const y = -parseFloat(cs.top) || 0;
+        el.style.setProperty('position', 'static', 'important');
+        if (y) scrollTo(0, y);
+      }
+    }
+  }
+
+  function restoreTucked() {
+    for (const el of tucked) el.classList.remove('spiderpet-tucked');
+    tucked.clear();
+    for (const [el, style] of unlocked.reverse()) {
+      if (style == null) el.removeAttribute('style');
+      else el.setAttribute('style', style);
+    }
+    unlocked.length = 0;
+  }
+
+  // What floats on top of the page right now, at a few spots across the view.
+  function lookForBlockers() {
+    const found = new Set();
+    for (const [fx, fy] of [[0.5, 0.5], [0.25, 0.3], [0.75, 0.3], [0.25, 0.7], [0.75, 0.7], [0.5, 0.94], [0.5, 0.06]]) {
+      const top = document.elementFromPoint(innerWidth * fx, innerHeight * fy);
+      if (!top || top === host) continue;
+      const box = floatingBox(top);
+      if (box && !judged.has(box) && !tucked.has(box)) found.add(box);
+    }
+    if (!found.size) return;
+    const pageText = (document.body.innerText || '').length || 1;
+    const main = mainRoot();
+    const unclear = [];
+    for (const box of found) {
+      const cover = coverOf(box);
+      const text = squash(box.innerText || '');
+      // The site itself (an app pinned to the screen, a player, the article): never.
+      if (box.contains(main) && main !== document.body) { judged.add(box); continue; }
+      if (text.length > 3000 || text.length > pageText * 0.4) { judged.add(box); continue; }
+      if (cover < 0.12) { judged.add(box); continue; } // a slim header or a chat bubble does not block anything
+      const dialog = box.matches('[role=dialog], [role=alertdialog], [aria-modal=true], dialog') || !!box.querySelector('[role=dialog], [aria-modal=true]');
+      const backdrop = text.length < 20 && cover > 0.5;
+      if (backdrop || (dialog && cover > 0.2) || POPUP_WORDS.test(text.slice(0, 800))) tuck(box);
+      else unclear.push({ box, cover, text });
+    }
+    if (unclear.length) askAboutBlockers(unclear);
+  }
+
+  function askAboutBlockers(list) {
+    const items = list.map(({ box, cover, text }) => {
+      const key = 'b' + ++blockerKey;
+      judged.add(box);
+      pendingBlockers.set(key, { box, cover, text });
+      const buttons = [...box.querySelectorAll('button, [role=button], a')]
+        .map((b) => squash(b.innerText || b.getAttribute('aria-label') || '')).filter(Boolean).slice(0, 6);
+      return { key, tag: box.tagName.toLowerCase(), role: box.getAttribute('role') || '', id: box.id || '',
+        classes: String(box.className?.baseVal ?? box.className ?? '').slice(0, 100), cover: Math.round(cover * 100),
+        text: text.slice(0, 400), buttons };
+    });
+    const keys = items.map((i) => i.key);
+    const fallback = () => decideByRules(keys);
+    api.runtime.sendMessage({ type: 'blockers', url: pageUrl(), items }).then((r) => {
+      if (r?.fallback) fallback();
+    }).catch(fallback);
+    setTimeout(fallback, 8000); // the AI did not answer in time
+  }
+
+  // No AI: only what covers much of the view and says little goes.
+  function decideByRules(keys = [...pendingBlockers.keys()]) {
+    for (const k of keys) {
+      const p = pendingBlockers.get(k);
+      pendingBlockers.delete(k);
+      if (p && p.cover > 0.4 && p.text.length < 1500) tuck(p.box);
+    }
+  }
+
+  function onBlockerDecisions(m) {
+    if (m.fallback || !m.decisions) return decideByRules();
+    for (const [key, d] of Object.entries(m.decisions)) {
+      const p = pendingBlockers.get(key);
+      if (!p) continue;
+      pendingBlockers.delete(key);
+      if (d?.action === 'hide') tuck(p.box);
+    }
+  }
+
   // ------------------------------------------------------------------ behaviour
 
   let finds = [];
@@ -1128,11 +1282,25 @@
   // the longer the wait before the next one.
   let scanGap = 3;
   let scanMs = 0;
+  let scans = 0;
   const observer = new MutationObserver(() => {
     domDirty = true;
   });
   // The spider's own changes (restyled words, badges) are not news.
   const ownChanges = () => observer.takeRecords();
+  // Busy pages (feeds that never stop loading) are read again when the
+  // browser has a moment to spare, never in the middle of a scroll or a frame.
+  let rescanQueued = false;
+  function rescanSoon() {
+    if (rescanQueued) return;
+    rescanQueued = true;
+    const run = () => {
+      rescanQueued = false;
+      if (running) rescan(false);
+    };
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(run, { timeout: 1500 });
+    else setTimeout(run, 200);
+  }
 
   // Where a silk thread ends. Measuring forces the browser to lay the page
   // out, so each spot is measured twice a second, not every frame.
@@ -1159,8 +1327,9 @@
     skipMemo = new WeakMap();
     const got = scan();
     lastScanAt = now();
+    scans++;
     scanMs = (lastScanAt - t0) * 1000;
-    scanGap = clamp((lastScanAt - t0) * 40, 3, 30);
+    scanGap = clamp((lastScanAt - t0) * 40, 4, 30);
     const fresh = [];
     for (const f of got) {
       const old = byId.get(f.id);
@@ -1190,8 +1359,11 @@
 
   function sendPage() {
     const root = mainRoot();
-    const text = squash((root.innerText || '').replace(/\[\d+\]/g, '')).slice(0, 8000);
-    api.runtime.sendMessage({ type: 'page', url: pageUrl(), title: document.title, lang: document.documentElement.lang || '', text }).catch(() => {});
+    // Line breaks stay: on sites without full stops (posts, feeds) they are where sentences end.
+    const text = (root.innerText || '').replace(/\[\d+\]/g, '').replace(/[ \t ]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim().slice(0, 8000);
+    const meta = (n) => document.querySelector(`meta[name="${n}"], meta[property="${n}"]`)?.content?.trim() || '';
+    const desc = meta('og:description') || meta('description') || meta('twitter:description');
+    api.runtime.sendMessage({ type: 'page', url: pageUrl(), title: document.title, lang: document.documentElement.lang || '', desc, text }).catch(() => {});
   }
 
   // What next: the most valuable find near the spider, in view, in reading
@@ -1261,6 +1433,11 @@
 
   function step(t, dt) {
     const k = spider.scale;
+    // Anything new floating over the page? (Popups often come a few seconds in.)
+    if (t - blockersAt > 1.5 && mode !== 'held' && app.settings?.popups !== false) {
+      blockersAt = t;
+      lookForBlockers();
+    }
     if (pageUrl() !== lastUrl) {
       // A single-page app moved on without a reload.
       lastUrl = pageUrl();
@@ -1322,7 +1499,7 @@
           target = chooseTarget();
           if (!target) {
             // Out of food in view: look again if the page changed (lazy pages), then crawl down.
-            if (domDirty && t - lastScanAt > scanGap && rescan(false)) break;
+            if (domDirty && t - lastScanAt > scanGap) rescanSoon();
             // On a hunt it jumps straight to the next match and drops in on a thread.
             if (terms.length && t - ourScrollAt > 0.9) {
               const next = nextMatch();
@@ -1404,7 +1581,8 @@
         if (t - chooseAt < 0.5) break;
         chooseAt = t;
         // New things in view (you scrolled, the page grew): back to work.
-        if (t - modeAt > 1.5 && (chooseTarget() || (domDirty && t - lastScanAt > scanGap && rescan(false)))) {
+        if (domDirty && t - lastScanAt > scanGap) rescanSoon();
+        if (t - modeAt > 1.5 && chooseTarget()) {
           restingSaid = false;
           setMode('walk');
         } else if (t - modeAt > 6 && app.settings?.crawl !== false && !atBottom() && t - userScrolledAt > 4) {
@@ -1528,7 +1706,8 @@
         tether = null;
         setMode('walk');
       }
-      think(goal ? say.hunt() : say.sense());
+      // A question with nothing to hunt (what is this page about?): it reads instead.
+      think(goal ? (terms.length ? say.hunt() : 'reading it for you…') : say.sense());
     }
     rescan(false); // sentences that match the search join the hunt
     lightGoal();
@@ -1572,6 +1751,13 @@
         break;
       case 'gist':
         if (m.gist?.summary && !terms.length) think('habitat: ' + short(m.gist.summary.toLowerCase().replace(/\.$/, ''), 44));
+        break;
+      case 'blockers':
+        onBlockerDecisions(m);
+        break;
+      case 'answer':
+        // The answer to what you asked in the app: it stays in the cloud a while.
+        if (m.text && m.goal === goal) think(short(m.text.replace(/\n- /g, ' · '), 160), 9);
         break;
       case 'reveal':
         // Finish the bite in progress; the walk picks the request up next.
@@ -1667,6 +1853,7 @@
       hl['reading-key'].clear();
       hl.goal.clear();
     }
+    restoreTucked();
     api.runtime.sendMessage({ type: 'stopped' }).catch(() => {});
     // Restyled text and checks stay, so you can still read them.
   }
@@ -1677,7 +1864,7 @@
     },
     running: () => running,
     // For tests and bug reports: how hard the spider is working.
-    stats: () => ({ mode, finds: finds.length, eaten: finds.filter((f) => f.eaten).length, scanMs: Math.round(scanMs), scanGap, goal, terms }),
+    stats: () => ({ mode, finds: finds.length, eaten: finds.filter((f) => f.eaten).length, scans, scanMs: Math.round(scanMs), scanGap, goal, terms, thought }),
   };
   start();
 })();

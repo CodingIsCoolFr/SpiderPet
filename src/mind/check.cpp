@@ -164,6 +164,15 @@ void Checker::load_cache() {
   if (j.is_object()) cache_ = std::move(j);
 }
 
+void Checker::forget() {
+  {
+    std::lock_guard lock(mu_);
+    cache_ = json::object();
+    cache_dirty_ = true;
+  }
+  save_cache();
+}
+
 void Checker::save_cache() {
   std::lock_guard lock(mu_);
   if (!cache_dirty_) return;
@@ -771,6 +780,60 @@ json Checker::expand(const std::string& goal) {
     for (const json& t : j["terms"])
       if (t.is_string() && t.get<std::string>().size() >= 2 && t.get<std::string>().size() <= 40) terms.push_back(lower_ascii(t.get<std::string>()));
   return terms;
+}
+
+json Checker::answer(const std::string& question, const std::string& title, const std::string& text) {
+  const json schema = {{"type", "object"},
+                       {"properties", {{"answer", {{"type", "string"}}}, {"quote", {{"type", "string"}}}, {"found", {{"type", "boolean"}}}}},
+                       {"required", {"answer", "quote", "found"}}};
+  const json j = ask(
+      "You answer a reader's question about the web page they are looking at, using ONLY the page text given. "
+      "answer: at most three short sentences in plain words. If the page does not say, set found to false and say "
+      "that the page does not say. quote: copy the one sentence from the page text that best supports the answer, "
+      "word for word; empty when nothing does.",
+      "Title: " + title + "\n\nPage text:\n" + text.substr(0, 7000) + "\n\nQuestion: " + question, schema, 260);
+  if (!j.is_object() || str(j, "answer").empty()) return nullptr;
+  json out = {{"answer", str(j, "answer")}, {"quote", ""}};
+  // A quote has to really be on the page; a made-up one is dropped.
+  const std::string q = str(j, "quote");
+  if (q.size() >= 12 && squash(text).find(squash(q)) != std::string::npos) out["quote"] = q;
+  return out;
+}
+
+json Checker::blockers(const json& items) {
+  if (!items.is_array() || items.empty()) return json::object();
+  const json schema = {
+      {"type", "object"},
+      {"properties",
+       {{"decisions",
+         {{"type", "array"},
+          {"items",
+           {{"type", "object"},
+            {"properties",
+             {{"key", {{"type", "string"}}},
+              {"action", {{"type", "string"}, {"enum", {"hide", "keep"}}}},
+              {"kind", {{"type", "string"},
+                        {"enum", {"cookie banner", "sign-up or log-in wall", "newsletter", "advertisement", "app banner",
+                                  "notification prompt", "backdrop", "site content", "site navigation", "player", "other"}}}},
+              {"why", {{"type", "string"}}}}},
+            {"required", {"key", "action", "kind", "why"}}}}}}}},
+      {"required", {"decisions"}}};
+  std::string list;
+  for (const json& it : items) list += it.dump(-1, ' ', false, json::error_handler_t::replace) + "\n";
+  const json j = ask(
+      "A reading assistant is looking at a web page for its user. The boxes below float over the page, pinned to the "
+      "screen on top of it (cover = how much of the screen they cover, in percent). For each box decide: hide it if it "
+      "only gets in the way of reading (a cookie or consent banner, a sign-up or log-in wall, a newsletter popup, an "
+      "advertisement, an app-install banner, a notification prompt, an empty dark backdrop); keep it if it is part of "
+      "what the user came for or needs (the article or post itself, a video player, the site's own menu bar). Hiding "
+      "only takes it off the screen; nothing is clicked or accepted. why: at most 12 words.",
+      "Boxes, one per line:\n" + list.substr(0, 6000), schema, 120 + 60 * static_cast<int>(items.size()));
+  if (!j.is_object() || !j.contains("decisions") || !j["decisions"].is_array()) return nullptr;
+  json out = json::object();
+  for (const json& d : j["decisions"])
+    if (d.is_object() && !str(d, "key").empty())
+      out[str(d, "key")] = {{"action", str(d, "action")}, {"kind", str(d, "kind")}, {"why", str(d, "why")}};
+  return out;
 }
 
 json Checker::gist(const std::string& title, const std::string& url, const std::string& text) {

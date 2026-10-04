@@ -130,7 +130,9 @@ function fromApp(m) {
     case 'verdict':
     case 'scores':
     case 'known':
-    case 'gist': {
+    case 'gist':
+    case 'answer':
+    case 'blockers': {
       const url = cleanUrl(m.url);
       for (const [id, u] of tabUrls) if (u === url) sendTab(id, m);
       break;
@@ -294,6 +296,11 @@ api.runtime.onMessage.addListener((m, sender, reply) => {
       return false;
     case 'check':
       toApp({ type: 'check', id: m.id });
+      return false;
+    case 'blockers':
+      // Things floating over the page: the app's AI says which are popups.
+      if (!app.connected) reply({ fallback: true });
+      else toApp({ type: 'blockers', url: cleanUrl(m.url), items: m.items });
       return false;
   }
   return false;

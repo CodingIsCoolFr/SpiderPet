@@ -50,7 +50,7 @@ std::string csv(const std::string& v) {
 
 json Settings::to_json() const {
   return {{"goal", goal},          {"online", online},       {"auto_check", auto_check},
-          {"check_sentences", check_sentences}, {"crawl", crawl}, {"model", model}};
+          {"check_sentences", check_sentences}, {"crawl", crawl}, {"popups", popups}, {"model", model}};
 }
 
 void Settings::from_json(const json& j) {
@@ -60,6 +60,7 @@ void Settings::from_json(const json& j) {
   auto_check = j.value("auto_check", auto_check);
   check_sentences = j.value("check_sentences", check_sentences);
   crawl = j.value("crawl", crawl);
+  popups = j.value("popups", popups);
   model = j.value("model", model);
 }
 

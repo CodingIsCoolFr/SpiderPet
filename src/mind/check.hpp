@@ -40,11 +40,19 @@ class Checker {
   nlohmann::json rank(const std::string& goal, const std::string& title, const nlohmann::json& items);
   // Search terms (synonyms, plurals, related names) for what the user typed.
   nlohmann::json expand(const std::string& goal);
+  // Answers a question about a page from the page's text only:
+  // {answer, quote} (the quote is checked to really be on the page). Null without the model.
+  nlohmann::json answer(const std::string& question, const std::string& title, const std::string& text);
+  // Things floating over a page ({key, tag, role, classes, cover, text, buttons}):
+  // which are popups to tuck away. -> {key: {action: hide|keep, kind, why}}. Null without the model.
+  nlohmann::json blockers(const nlohmann::json& items);
   // One sentence, up to three key points, and what kind of page it is.
   nlohmann::json gist(const std::string& title, const std::string& url, const std::string& text);
   // True for a while after the model got squeezed out of the graphics card
   // (another app took the memory): model work waits, so the PC stays smooth.
   bool gpu_busy() const;
+  // Drops every remembered check answer (checks.json), so finds are looked up afresh.
+  void forget();
 
  private:
   nlohmann::json check_doi(const std::string& doi, const std::string& context);
