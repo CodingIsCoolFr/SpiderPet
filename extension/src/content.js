@@ -1256,7 +1256,7 @@
   const byId = new Map();
   let app = { connected: false, settings: {} };
   let spider = null;
-  let mode = 'drop'; // drop, walk, lasso, eat, rest, held
+  let mode = 'drop'; // drop, walk, lasso, eat, rest, held, act
   let target = null;
   let tether = null;
   let modeAt = 0;
@@ -1499,14 +1499,41 @@
         if (spider.pos.y >= landY - 1) {
           spider.airborne = false;
           spider.place(spider.pos, Math.PI / 2);
+          target = null;
+          if (act?.f) {
+            setMode('act');
+            break;
+          }
           think(!app.connected ? say.offline() : terms.length ? say.hunt() : say.land());
           setMode('walk');
-          target = null;
         }
         break;
       }
       case 'held':
         break;
+      case 'act': {
+        // Walk to what you asked for and hold it until you say yes or no in the app.
+        if (!act?.f) {
+          tether = null;
+          setMode('walk');
+          break;
+        }
+        const goalPt = approachPoint(act.f);
+        if (!goalPt) {
+          if (!act.el.isConnected) actFail('it is gone from the page.');
+          break;
+        }
+        if (!tether) tether = { f: act.f, amount: 1, mode: 'travel' };
+        spider.setGoal(goalPt, 680 * k, 70 * k);
+        const b = boxOf(act.f);
+        const near = V(clamp(spider.pos.x, b.x, b.x + b.w), clamp(spider.pos.y, b.y, b.y + b.h));
+        if (dist(spider.pos, near) < spider.reach * 1.05 || (dist(spider.pos, goalPt) < 12 * k && spider.speed() < 40 * k)) {
+          spider.face = Math.atan2(near.y - spider.pos.y, near.x - spider.pos.x);
+          if (tether?.mode !== 'grab') tether = { f: act.f, amount: 0, mode: 'grab', at: t };
+          tether.amount = Math.min(1, (t - tether.at) / 0.22);
+        }
+        break;
+      }
       case 'walk': {
         if (revealId) {
           const f = byId.get(revealId);
@@ -1692,7 +1719,7 @@
     spider.airborne = false;
     spider.place(spider.pos);
     think(say.landed());
-    setMode('walk');
+    setMode(act?.f ? 'act' : 'walk');
   });
 
   // You are scrolling: the background work pauses so nothing moves under your hand.
@@ -1702,6 +1729,288 @@
   const onKey = (e) => {
     if (e.key === 'Escape' && e.shiftKey) stop();
   };
+
+  // ------------------------------------------------------------------ doing what you ask
+
+  // A command typed in the app ("click Sign in", "type cats into search").
+  // The spider finds the thing, walks over and holds it with its lasso; it only
+  // clicks or types when you press "Do it" in the app. A page can't press that
+  // for you: the button lives in the app, not on the page.
+  let act = null; // { seq, step, f, el, ready }
+
+  const CLICKABLE =
+    'a[href], button, input:not([type=hidden]), textarea, select, summary, label, [role=button], [role=link], [role=tab], ' +
+    '[role=menuitem], [role=menuitemcheckbox], [role=menuitemradio], [role=option], [role=checkbox], [role=radio], ' +
+    '[role=switch], [role=combobox], [role=searchbox], [role=textbox], [contenteditable=""], [contenteditable=true], [onclick]';
+  const FIELD =
+    'input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]):not([type=checkbox]):not([type=radio]):not([type=image]), ' +
+    'textarea, [role=searchbox], [role=textbox], [role=combobox], [contenteditable=""], [contenteditable=true]';
+  // Words that say the click may cost money, send something, or can't be undone.
+  // "Post" only as the button's first word: "Like this post" is harmless.
+  const RISKY =
+    /\b(buy|pay|purchase|order|checkout|check out|subscribe|unsubscribe|delete|remove|send|publish|submit|confirm|transfer|donate|sign up|register|log ?out|sign out)\b|^(post|reply|tweet|share)\b/i;
+
+  // Passwords, card numbers and one-time codes: the spider never types there.
+  function secret(el) {
+    if (el.matches?.('input[type=password], input[type=file], input[type=hidden]')) return true;
+    if (/cc-|password|one-time-code/i.test(el.getAttribute?.('autocomplete') || '')) return true;
+    return /passw|card.?num|cvv|cvc|security.?code|iban|ssn|social.?sec|\botp\b/i.test(`${el.name || ''} ${el.id || ''}`);
+  }
+
+  function kindOfEl(el) {
+    const tag = el.tagName.toLowerCase();
+    const role = (el.getAttribute('role') || '').toLowerCase();
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    if (role === 'checkbox' || role === 'switch' || type === 'checkbox' || type === 'radio' || role === 'radio') return 'checkbox';
+    if (tag === 'input' && /^(submit|button|reset|image)$/.test(type)) return 'button';
+    if (el.matches(FIELD)) return 'field';
+    if (tag === 'select') return 'list';
+    if (tag === 'a' || role === 'link') return 'link';
+    if (role === 'tab') return 'tab';
+    if (role.startsWith('menuitem') || role === 'option') return 'menu item';
+    return 'button';
+  }
+
+  function labelOf(el) {
+    const byIds = (ids) =>
+      squash((ids || '').split(/\s+/).map((id) => document.getElementById(id)?.textContent || '').join(' '));
+    const img = el.querySelector?.('img[alt], svg title');
+    const tries = [
+      el.getAttribute('aria-label'),
+      byIds(el.getAttribute('aria-labelledby')),
+      el.labels?.[0]?.innerText,
+      el.matches(FIELD) ? '' : el.innerText,
+      /^(submit|button|reset)$/i.test(el.getAttribute('type') || '') ? el.value : '',
+      el.getAttribute('placeholder'),
+      el.getAttribute('title'),
+      el.getAttribute('alt'),
+      img?.getAttribute?.('alt') || img?.textContent,
+      el.getAttribute('name'),
+    ];
+    for (const s of tries) {
+      const t = squash(String(s || ''));
+      if (t) return t.length > 80 ? t.slice(0, 79) + '…' : t;
+    }
+    return '';
+  }
+
+  const words = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+
+  // How well an element fits what you said: its own words first.
+  function fit(want, hint, el, label) {
+    const w = words(want);
+    const l = words(label);
+    if (!w || !l) return 0;
+    let s = 0;
+    if (l === w) s = 100;
+    else if (l.startsWith(w + ' ') || l.startsWith(w)) s = 80;
+    else if ((' ' + l + ' ').includes(' ' + w + ' ')) s = 70;
+    else if (w.startsWith(l) && l.length >= 3) s = 55;
+    else {
+      const ws = w.split(' ');
+      const ls = new Set(l.split(' '));
+      const shared = ws.filter((x) => ls.has(x)).length;
+      s = (shared / ws.length) * 50 - Math.max(0, ls.size - ws.length) * 1.5;
+    }
+    if (hint && s > 0) s += kindOfEl(el) === hint ? 15 : -10;
+    return s;
+  }
+
+  function candidates(fieldsOnly) {
+    const out = [];
+    const all = document.querySelectorAll(fieldsOnly ? FIELD : CLICKABLE);
+    for (let i = 0; i < all.length && out.length < 3000; i++) {
+      const el = all[i];
+      if (el.closest('#spiderpet-host, .spiderpet-badge') || el.disabled || !shown(el)) continue;
+      // A label around a field is the same thing twice: keep the field.
+      if (!fieldsOnly && el.tagName === 'LABEL' && el.control) continue;
+      const r = el.getBoundingClientRect();
+      out.push({ el, label: labelOf(el), kind: kindOfEl(el), inView: r.bottom > 0 && r.top < innerHeight, order: i });
+    }
+    return out;
+  }
+
+  // "the search box", "Sign in button" -> what to look for, and what kind of thing it is.
+  function wantOf(what) {
+    let w = squash(String(what || '').replace(/^["'“”‘’]+|["'“”‘’]+$/g, ''));
+    w = w.replace(/^(the|a|an|on|on the)\s+/i, '');
+    let hint = '';
+    const m = w.match(/\s+(button|link|tab|field|box|text ?box|input|checkbox|check ?box|switch|toggle|icon|menu|option)$/i);
+    if (m) {
+      w = w.slice(0, m.index);
+      const k = m[1].toLowerCase().replace(' ', '');
+      hint = { button: 'button', icon: 'button', link: 'link', tab: 'tab', field: 'field', box: 'field', textbox: 'field', input: 'field', checkbox: 'checkbox', switch: 'checkbox', toggle: 'checkbox', menu: 'menu item', option: 'menu item' }[k] || '';
+    }
+    return { want: w.replace(/^["'“”]+|["'“”]+$/g, ''), hint };
+  }
+
+  function rankFor(step) {
+    const typing = step.verb === 'type';
+    const { want, hint } = wantOf(step.what || (typing ? 'search' : ''));
+    let list = candidates(typing);
+    for (const c of list) {
+      c.score = fit(want, hint, c.el, c.label);
+      if (typing && /search/i.test(want)) {
+        // The site's own search box, whatever it is labeled.
+        const el = c.el;
+        if (el.type === 'search' || el.getAttribute('role') === 'searchbox' || el.name === 'q' || el.closest('form[role=search], [role=search]'))
+          c.score = Math.max(c.score, 75);
+      }
+      if (c.score > 0 && c.inView) c.score += 8;
+    }
+    // Password and card boxes are never offered for typing, not even to the AI.
+    if (typing) list = list.filter((c) => !secret(c.el));
+    list.sort((a, b) => b.score - a.score || a.order - b.order);
+    return { want, list };
+  }
+
+  function short2(s, n) {
+    return s.length > n ? s.slice(0, n - 1) + '…' : s;
+  }
+
+  function describe(step, c) {
+    const what = c.label ? `"${short2(c.label, 60)}"` : `this ${c.kind}`;
+    if (step.verb === 'type') return `Type "${short2(step.text, 60)}" into ${what}${step.enter ? ' and press Enter' : ''}`;
+    return `Click ${what} (${c.kind})`;
+  }
+
+  function actReport(m) {
+    api.runtime.sendMessage({ ...m, seq: act?.seq ?? m.seq }).catch(() => {});
+  }
+
+  function actFail(note) {
+    if (act) actReport({ type: 'act-done', ok: false, note });
+    think(note, 5);
+    endAct();
+  }
+
+  function endAct() {
+    act = null;
+    if (mode === 'act') {
+      tether = null;
+      target = null;
+      spider.face = null;
+      setMode('walk');
+    }
+  }
+
+  // Lock on to the chosen element: the spider walks there and the app asks you.
+  function propose(c) {
+    if (!act) return;
+    act.el = c.el;
+    act.f = { el: c.el, kind: 'act', text: c.label };
+    act.desc = describe(act.step, c);
+    act.warn = RISKY.test(c.label) || (act.step.enter && RISKY.test(act.step.what || ''));
+    const r = c.el.getBoundingClientRect();
+    if (r.bottom < 0 || r.top > innerHeight) c.el.scrollIntoView({ block: 'center', behavior: 'smooth' }); // you have to see it to say yes
+    target = null;
+    tether = { f: act.f, amount: 1, mode: 'travel' };
+    readingRange = null;
+    if (mode !== 'drop' && mode !== 'held') setMode('act');
+    think(act.desc.toLowerCase() + '? say so in the app.', 30);
+    actReport({ type: 'act-ready', desc: act.desc, warn: act.warn });
+  }
+
+  function startAct(m) {
+    if (act) actReport({ type: 'act-done', ok: false, note: 'replaced by a new command', seq: act.seq });
+    const step = m.step || {};
+    act = { seq: m.seq, step };
+    if (step.verb === 'scroll') {
+      const d = step.dir;
+      if (d === 'top') scrollTo({ top: 0, behavior: 'smooth' });
+      else if (d === 'bottom') scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
+      else scrollBy({ top: (d === 'up' ? -0.8 : 0.8) * innerHeight, behavior: 'smooth' });
+      actReport({ type: 'act-done', ok: true, note: 'scrolled' });
+      act = null;
+      return;
+    }
+    if (step.verb === 'type' && !String(step.text || '')) return actFail('nothing to type.');
+    const { want, list } = rankFor(step);
+    const best = list[0];
+    const second = list[1];
+    // Sure enough: the words match and nothing else matches as well.
+    if (best && best.score >= 60 && (!second || second.score < best.score - 8 || words(second.label) === words(best.label))) return propose(best);
+    // Not sure: the app's AI picks from what is on the page (it only sees the labels).
+    const pool = list.filter((c) => c.score > 0).slice(0, 30);
+    for (const c of list) {
+      if (pool.length >= 60) break;
+      if (c.inView && !pool.includes(c) && c.label) pool.push(c);
+    }
+    act.pool = pool;
+    act.fallback = best && best.score >= 30 ? best : null;
+    if (!pool.length) return actFail(`can't find "${short2(want, 40)}" here.`);
+    think('which one is it…');
+    actReport({
+      type: 'act-ask',
+      command: m.command || '',
+      items: pool.map((c, i) => ({ i, kind: c.kind, label: c.label, href: c.el.href ? String(c.el.href).slice(0, 80) : '', inView: c.inView })),
+    });
+  }
+
+  function onPick(m) {
+    if (!act || act.seq !== m.seq || act.el) return;
+    const c = m.index >= 0 ? act.pool?.[m.index] : null;
+    if (c) return propose(c);
+    if (act.fallback) return propose(act.fallback);
+    actFail(m.why ? short2(m.why, 80) : "can't tell which one you mean.");
+  }
+
+  function fire(el, type, x, y, extra = {}) {
+    const o = { bubbles: true, cancelable: true, composed: true, clientX: x, clientY: y, button: 0, buttons: type.endsWith('down') ? 1 : 0, ...extra };
+    const E = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent;
+    return el.dispatchEvent(new E(type, type.startsWith('pointer') ? { ...o, pointerType: 'mouse', isPrimary: true, pointerId: 1 } : o));
+  }
+
+  function doClick(el) {
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2;
+    const y = r.top + r.height / 2;
+    fire(el, 'pointerdown', x, y);
+    fire(el, 'mousedown', x, y);
+    el.focus?.({ preventScroll: true });
+    fire(el, 'pointerup', x, y);
+    fire(el, 'mouseup', x, y);
+    el.click();
+  }
+
+  function doType(el, text, enter) {
+    if (secret(el)) throw new Error('that is a password or payment field: the spider never types there.');
+    el.focus?.({ preventScroll: true });
+    if (el.isContentEditable) {
+      document.execCommand('selectAll', false);
+      document.execCommand('insertText', false, text);
+    } else if ('value' in el) {
+      // The browser's own setter, so sites that watch the box (React, Vue) see the change.
+      const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, text);
+      el.dispatchEvent(new InputEvent('input', { bubbles: true, composed: true, data: text, inputType: 'insertText' }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    } else {
+      throw new Error("that isn't a box you can type in.");
+    }
+    if (!enter) return;
+    const key = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
+    const handled = !el.dispatchEvent(new KeyboardEvent('keydown', key));
+    el.dispatchEvent(new KeyboardEvent('keypress', key));
+    el.dispatchEvent(new KeyboardEvent('keyup', key));
+    // The site's own script took the Enter; otherwise the form is sent the way Enter would.
+    if (!handled && el.form) el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit();
+  }
+
+  function go(m) {
+    if (!act || act.seq !== m.seq || !act.el) return;
+    const { el, step } = act;
+    if (!el.isConnected) return actFail('it is gone from the page.');
+    try {
+      if (step.verb === 'type') doType(el, String(step.text), !!step.enter);
+      else doClick(el);
+    } catch (e) {
+      return actFail(String(e?.message || e));
+    }
+    actReport({ type: 'act-done', ok: true, note: act.desc });
+    think('done.', 3);
+    endAct();
+  }
 
   // ------------------------------------------------------------------ messages
 
@@ -1777,6 +2086,21 @@
         if (mode === 'rest') setMode('walk');
         if (mode === 'walk') target = null;
         break;
+      case 'act':
+        startAct(m);
+        break;
+      case 'act-pick':
+        onPick(m);
+        break;
+      case 'act-go':
+        go(m);
+        break;
+      case 'act-cancel':
+        if (act && act.seq === m.seq) {
+          think('ok, leaving it.', 3);
+          endAct();
+        }
+        break;
       case 'stop':
         stop();
         break;
@@ -1851,6 +2175,7 @@
 
   function stop() {
     if (!running) return;
+    if (act) actFail('the spider was stopped.');
     running = false;
     cancelAnimationFrame(raf);
     host.remove();

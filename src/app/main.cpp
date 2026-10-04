@@ -47,7 +47,7 @@ namespace {
 constexpr UINT kTrayMsg = WM_APP + 1;
 constexpr UINT kShowMsg = WM_APP + 2;
 constexpr UINT kWakeMsg = WM_APP + 3;
-constexpr const char* kVersion = "3.2.1";
+constexpr const char* kVersion = "3.3.0";
 
 ImVec4 hexv(uint32_t c, float a = 1.f) {
   return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
@@ -256,6 +256,185 @@ std::string quick_answer(Ask kind, const std::string& goal, const std::string& t
   return out;
 }
 
+// ---------------------------------------------------------------- commands
+
+// English letters made small, every other byte left as it is, so a position
+// in the copy is the same position in what you typed.
+std::string ascii_lower(std::string s) {
+  for (char& c : s)
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  return s;
+}
+
+std::string trim_cmd(const std::string& s) {
+  std::string t = utf8(trim(wide(s)));
+  while (!t.empty() && (t.back() == '.' || t.back() == '!' || t.back() == ' ')) t.pop_back();
+  return t;
+}
+
+std::string unquote(std::string s) {
+  s = trim_cmd(s);
+  for (const char* q : {"\"", "'", "\xE2\x80\x9C", "\xE2\x80\x9D", "\xE2\x80\x98", "\xE2\x80\x99"}) {
+    const size_t n = strlen(q);
+    if (s.size() >= n && s.compare(0, n, q) == 0) s.erase(0, n);
+    if (s.size() >= n && s.compare(s.size() - n, n, q) == 0) s.erase(s.size() - n);
+  }
+  return s;
+}
+
+bool is_quoted(const std::string& s) {
+  const std::string t = trim_cmd(s);
+  return !t.empty() && (t[0] == '"' || t[0] == '\'' || t.rfind("\xE2\x80\x9C", 0) == 0);
+}
+
+// "youtube.com", "https://en.wikipedia.org/wiki/Spider" -> a web address; "youtube" -> nothing.
+std::string as_url(const std::string& s) {
+  const std::string t = unquote(s);
+  if (t.empty() || t.find(' ') != std::string::npos) return "";
+  const std::string lo = ascii_lower(t);
+  if (lo.rfind("http://", 0) == 0 || lo.rfind("https://", 0) == 0) return t;
+  const std::string host = lo.substr(0, lo.find('/'));
+  const size_t dot = host.rfind('.');
+  if (dot == std::string::npos || dot == 0 || host.size() - dot - 1 < 2 || host.size() - dot - 1 > 24) return "";
+  for (size_t i = dot + 1; i < host.size(); ++i)
+    if (host[i] < 'a' || host[i] > 'z') return "";
+  return "https://" + t;
+}
+
+// One step of a command, or null when it is not one.
+json parse_step(const std::string& part) {
+  const std::string p = trim_cmd(part);
+  const std::string lo = ascii_lower(p);
+  if (p.empty()) return nullptr;
+  auto is = [&](std::initializer_list<const char*> all) {
+    for (const char* a : all)
+      if (lo == a) return true;
+    return false;
+  };
+  // The words after one of these openers, as you typed them.
+  std::string rest;
+  auto after = [&](std::initializer_list<const char*> openers) {
+    for (const char* o : openers) {
+      const size_t n = strlen(o);
+      if (lo.size() > n && lo.compare(0, n, o) == 0) {
+        rest = trim_cmd(p.substr(n));
+        if (!rest.empty()) return true;
+      }
+    }
+    return false;
+  };
+  if (is({"scroll", "scroll down", "scroll down a bit", "page down"})) return {{"verb", "scroll"}, {"dir", "down"}};
+  if (is({"scroll up", "scroll up a bit", "page up"})) return {{"verb", "scroll"}, {"dir", "up"}};
+  if (is({"scroll to top", "scroll to the top", "go to top", "go to the top", "back to top", "back to the top"}))
+    return {{"verb", "scroll"}, {"dir", "top"}};
+  if (is({"scroll to bottom", "scroll to the bottom", "go to bottom", "go to the bottom"})) return {{"verb", "scroll"}, {"dir", "bottom"}};
+  if (is({"back", "go back", "go back a page", "previous page"})) return {{"verb", "back"}};
+  if (is({"forward", "go forward"})) return {{"verb", "forward"}};
+  if (is({"reload", "refresh", "reload page", "refresh page", "reload the page", "refresh the page"})) return {{"verb", "reload"}};
+  if (is({"press enter", "hit enter", "press return", "submit", "submit it"})) return {{"verb", "enter"}};
+
+  // Going somewhere: a web address opens in the tab; anything else is a link to click.
+  if (after({"go to ", "goto ", "visit ", "navigate to ", "open up ", "open "})) {
+    const std::string url = as_url(rest);
+    if (!url.empty()) return {{"verb", "goto"}, {"url", url}};
+    // "open source" is something to hunt for; "open the menu" is a command.
+    const std::string r = ascii_lower(rest);
+    const bool opener_is_open = lo.rfind("open", 0) == 0;
+    const bool thing = r.rfind("the ", 0) == 0 || r.rfind("my ", 0) == 0 || is_quoted(rest);
+    const bool named = r.ends_with(" link") || r.ends_with(" button") || r.ends_with(" tab") || r.ends_with(" menu") ||
+                       r.ends_with(" page") || r.ends_with(" settings");
+    if (!opener_is_open || thing || named) return {{"verb", "click"}, {"what", unquote(rest)}};
+    return nullptr;
+  }
+  if (after({"click on ", "click ", "tap on ", "tap ", "press on ", "press the ", "hit the ", "select the ", "choose the ",
+             "tick the ", "untick the ", "uncheck the ", "toggle the "})) {
+    // "press the X" keeps "the" out of what to find; the page matcher drops it anyway.
+    return {{"verb", "click"}, {"what", unquote(rest)}};
+  }
+  if (after({"search the site for ", "search this site for ", "search the website for ", "search this website for "}))
+    return {{"verb", "type"}, {"text", unquote(rest)}, {"what", "search"}, {"enter", true}};
+  if (after({"fill in ", "fill "})) {
+    const size_t at = ascii_lower(rest).rfind(" with ");
+    if (at != std::string::npos)
+      return {{"verb", "type"}, {"what", unquote(rest.substr(0, at))}, {"text", unquote(rest.substr(at + 6))}, {"enter", false}};
+    return nullptr;
+  }
+  if (after({"type ", "write ", "enter ", "put ", "input "})) {
+    bool enter = false;
+    std::string r = rest;
+    for (const char* tail : {" and press enter", " and hit enter", " and press return", " and submit", " and search", " and go"}) {
+      const std::string rl = ascii_lower(r);
+      if (rl.ends_with(tail)) {
+        r = trim_cmd(r.substr(0, r.size() - strlen(tail)));
+        enter = true;
+        break;
+      }
+    }
+    // The last " into " / " in " splits what to type from where: "type log in into search".
+    const std::string rl = ascii_lower(r);
+    size_t at = rl.rfind(" into ");
+    size_t skip = 6;
+    if (at == std::string::npos) at = rl.rfind(" in "), skip = 4;
+    if (at == std::string::npos) return nullptr;
+    const std::string text = r.substr(0, at), where = trim_cmd(r.substr(at + skip));
+    // "type 2 diabetes in children" is a search; "type cats into the search box" is a command.
+    const std::string wl = ascii_lower(where);
+    bool box = is_quoted(text) || wl.rfind("the ", 0) == 0;
+    for (const char* w : {"search", "box", "field", "bar", "input", "textbox", "text area", "comment", "message"})
+      if (wl.find(w) != std::string::npos) box = true;
+    if (!box || text.empty() || where.empty()) return nullptr;
+    return {{"verb", "type"}, {"text", unquote(text)}, {"what", unquote(where)}, {"enter", enter}};
+  }
+  return nullptr;
+}
+
+// A command for the spider ("click Sign in", "type cats into the search box
+// then press enter"): its steps, or an empty list for words to hunt or a question.
+json parse_task(const std::string& typed) {
+  const std::string all = trim_cmd(typed);
+  const std::string lo = ascii_lower(all);
+  std::vector<std::string> parts;
+  for (size_t from = 0;;) {
+    size_t best = std::string::npos, len = 0;
+    for (const char* sep : {", and then ", " and then ", ", then ", " then ", "; "}) {
+      const size_t at = lo.find(sep, from);
+      if (at < best) best = at, len = strlen(sep);
+    }
+    parts.push_back(all.substr(from, best == std::string::npos ? std::string::npos : best - from));
+    if (best == std::string::npos) break;
+    from = best + len;
+  }
+  json steps = json::array();
+  for (const std::string& part : parts) {
+    json s = parse_step(part);
+    if (s.is_null()) {
+      if (steps.empty()) return json::array();  // it does not start like a command: words to hunt
+      s = {{"verb", "click"}, {"what", unquote(part)}};  // "click Menu then Settings"
+    }
+    if (jstr(s, "verb") == "enter") {
+      // "type cats into search then press enter": Enter belongs to the typing.
+      if (steps.empty() || jstr(steps.back(), "verb") != "type") return json::array();
+      steps.back()["enter"] = true;
+      continue;
+    }
+    steps.push_back(s);
+  }
+  return steps.size() <= 8 ? steps : json::array();
+}
+
+// What a step will do, before the spider has found the thing on the page.
+std::string step_text(const json& s) {
+  const std::string v = jstr(s, "verb");
+  if (v == "scroll") return "Scroll " + jstr(s, "dir");
+  if (v == "back") return "Go back";
+  if (v == "forward") return "Go forward";
+  if (v == "reload") return "Reload the page";
+  if (v == "goto") return "Open " + jstr(s, "url");
+  if (v == "type")
+    return "Type \"" + jstr(s, "text") + "\" into " + jstr(s, "what") + (s.value("enter", false) ? " and press Enter" : "");
+  return "Click " + jstr(s, "what");
+}
+
 std::wstring exe_dir() {
   wchar_t path[MAX_PATH];
   GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -325,9 +504,15 @@ class App {
   bool confirm(const char* label, const char* again, const std::string& id);
   void send_spider(bool on);
   int matches(const json& f) const;
+  // commands: the spider does it on the page, one step at a time, after your "Do it"
+  void start_task(const std::string& command, const json& steps);  // called with mu_ held
+  void task_tick();
+  void task_stop(const std::string& note);  // called with mu_ held
+  void task_next();                         // the step worked; called with mu_ held
+  void draw_task();                         // called with mu_ held
 
   struct Job {
-    enum Type { Check, Rank, Gist, Expand, Answer, Blockers } type;
+    enum Type { Check, Rank, Gist, Expand, Answer, Blockers, Pick } type;
     std::string url, id;
     json data;
   };
@@ -380,6 +565,21 @@ class App {
   };
   std::map<std::string, PageText> texts_;  // the words of recent pages, for answers
   void queue_answer();                     // called with mu_ held
+  // A command you typed, step by step.
+  struct Task {
+    enum State { Idle, Waiting, Finding, Ready, Doing, Done, Failed } state = Idle;
+    std::string command;
+    json steps = json::array();
+    size_t at = 0;
+    int seq = 0;  // the step on its way to the page; late answers about older steps are dropped
+    int client = -1, tab = -1;
+    std::string desc, note;
+    bool warn = false;
+    double since = 0;  // when this state began (Waiting: when the next step may go)
+    std::vector<std::pair<std::string, bool>> log;  // finished steps
+  } task_;
+  int act_seq_ = 0;
+  std::vector<std::pair<int, json>> outbox_;  // sent after mu_ is let go
   json status_ = {{"ollama", false}, {"model", ""}};
   std::string busy_;                     // what the worker is doing
   std::deque<Job> urgent_, jobs_;
@@ -453,6 +653,7 @@ int App::run(HINSTANCE inst, bool tray) {
         if (msg.message == WM_QUIT) quitting_ = true;
       }
     }
+    task_tick();
     if (now_seconds() - saved_at > 3.0) {
       saved_at = now_seconds();
       std::lock_guard lock(mu_);
@@ -638,6 +839,29 @@ void App::on_message(int client, const json& raw) {
     }
     return;
   }
+  if (type == "act-ready" || type == "act-ask" || type == "act-done") {
+    // The spider's answer about the step it was given. Older steps are done with.
+    if (m.value("seq", -1) != task_.seq || client != task_.client) return;
+    if (type == "act-ready" && task_.state == Task::Finding) {
+      task_.state = Task::Ready;
+      task_.desc = jstr(m, "desc");
+      task_.warn = m.value("warn", false);
+      task_.since = now_seconds();
+    } else if (type == "act-ask" && task_.state == Task::Finding) {
+      // Not sure which thing you mean: the AI picks from the page's buttons and links.
+      urgent_.push_front({Job::Pick, jstr(m, "url"), "",
+                          {{"client", client}, {"tabId", task_.tab}, {"seq", task_.seq},
+                           {"want", step_text(task_.steps[task_.at])}, {"items", m.value("items", json::array())}}});
+      task_.since = now_seconds();
+      cv_.notify_all();
+    } else if (type == "act-done" && task_.state != Task::Idle && task_.state != Task::Done && task_.state != Task::Failed) {
+      const std::string note = jstr(m, "note");
+      if (!m.value("ok", false)) task_stop(note.empty() ? "It did not work." : note);
+      else task_next();
+    }
+    wake();
+    return;
+  }
   if (type == "settings") {
     lock.unlock();
     apply_settings(m.value("settings", json::object()));
@@ -744,7 +968,7 @@ void App::worker() {
       const bool gpu_busy = checker_.gpu_busy();
       auto needs_model = [&](const Job& j) {
         // Without the model these still answer: from the page's own sentences, or by the spider's rules.
-        if (j.type == Job::Answer || j.type == Job::Blockers) return false;
+        if (j.type == Job::Answer || j.type == Job::Blockers || j.type == Job::Pick) return false;
         if (j.type != Job::Check) return true;
         const json* f = lib_.find(j.id);
         return f && jstr(*f, "kind") == "sentence";
@@ -923,6 +1147,24 @@ void App::worker() {
       if (d.is_object()) reply["decisions"] = d;
       else reply["fallback"] = true;  // no AI now: the spider's own rules decide
       bridge_.send(job.data.value("client", -1), reply);
+    } else if (job.type == Job::Pick) {
+      {
+        std::lock_guard lock(mu_);
+        if (job.data.value("seq", -1) != task_.seq || task_.state != Task::Finding) continue;  // you cancelled
+        busy_ = "finding what you meant";
+      }
+      wake();
+      // Without the AI (paused or off) the spider takes its own best guess; you still say yes first.
+      const json p = checker_.pick(jstr(job.data, "want"), job.data.value("items", json::array()));
+      {
+        std::lock_guard lock(mu_);
+        busy_.clear();
+      }
+      bridge_.send(job.data.value("client", -1), {{"type", "act-pick"},
+                                                  {"seq", job.data.value("seq", -1)},
+                                                  {"tabId", job.data.value("tabId", -1)},
+                                                  {"index", p.is_object() ? p.value("index", -1) : -1},
+                                                  {"why", p.is_object() ? jstr(p, "why") : ""}});
     }
     wake();
   }
@@ -933,6 +1175,12 @@ void App::worker() {
 // spider on the page you are looking at goes hunting, and the model adds
 // synonyms a moment later.
 void App::commit_goal(const std::string& goal, bool force) {
+  // A command ("click Sign in") is not a search: the spider does it instead of hunting.
+  if (const json steps = parse_task(goal); !steps.empty()) {
+    std::lock_guard lock(mu_);
+    start_task(goal, steps);
+    return;
+  }
   int client = -1;
   json terms;
   {
@@ -1013,6 +1261,153 @@ bool App::confirm(const char* label, const char* again, const std::string& id) {
   armed_ = id;
   armed_at_ = now_seconds();
   return false;
+}
+
+// ---------------------------------------------------------------- commands
+
+void App::start_task(const std::string& command, const json& steps) {
+  if (task_.state == Task::Finding || task_.state == Task::Ready)
+    outbox_.push_back({task_.client, {{"type", "act-cancel"}, {"seq", task_.seq}, {"tabId", task_.tab}}});
+  task_ = Task{};
+  task_.command = command;
+  task_.steps = steps;
+  task_.state = Task::Waiting;
+  wake();
+}
+
+void App::task_next() {
+  task_.log.push_back({task_.desc.empty() ? step_text(task_.steps[task_.at]) : task_.desc, true});
+  task_.desc.clear();
+  task_.warn = false;
+  if (++task_.at < task_.steps.size()) {
+    task_.state = Task::Waiting;
+    task_.since = now_seconds() + 1.2;  // a click may have opened a new page: let it start loading
+  } else {
+    task_.state = Task::Done;
+    task_.since = now_seconds();
+  }
+}
+
+void App::task_stop(const std::string& note) {
+  if (task_.state == Task::Finding || task_.state == Task::Ready)
+    outbox_.push_back({task_.client, {{"type", "act-cancel"}, {"seq", task_.seq}, {"tabId", task_.tab}}});
+  if (!task_.desc.empty()) task_.log.push_back({task_.desc, false});
+  task_.desc.clear();
+  task_.state = Task::Failed;
+  task_.note = note;
+  task_.since = now_seconds();
+  wake();
+}
+
+// Sends the next step when it is due, gives up on a page that does not answer,
+// and sends what the window queued while it held the lock.
+void App::task_tick() {
+  std::vector<std::pair<int, json>> out;
+  {
+    std::lock_guard lock(mu_);
+    const double t = now_seconds();
+    if (task_.state == Task::Waiting && t >= task_.since) {
+      int client = -1;
+      const Browser* b = current(&client);
+      const json& step = task_.steps[task_.at];
+      const std::string verb = jstr(step, "verb");
+      const bool on_page = verb == "click" || verb == "type" || verb == "scroll";
+      if (!b) {
+        task_stop("No browser is connected.");
+      } else if (on_page && !b->web) {
+        task_stop("Open a web page first: the spider can't go on browser pages.");
+      } else {
+        // Each step goes to the tab you are looking at (a click may have opened a new one).
+        task_.client = client;
+        task_.tab = b->tab;
+        task_.seq = ++act_seq_;
+        task_.state = Task::Finding;
+        task_.since = t;
+        task_.desc.clear();
+        out.push_back({client, {{"type", "act"}, {"seq", task_.seq}, {"tabId", task_.tab}, {"step", step}, {"command", task_.command}}});
+        wake();
+      }
+    } else if (task_.state == Task::Finding && t - task_.since > 40) {
+      task_stop("The page did not answer. Try again, or start the spider on it first.");
+    } else if (task_.state == Task::Doing && t - task_.since > 8) {
+      task_next();  // the page moved on before the spider could say so: the click opened a new page
+      wake();
+    }
+    for (auto& o : outbox_) out.push_back(std::move(o));
+    outbox_.clear();
+  }
+  for (auto& [c, m] : out) bridge_.send(c, m);
+}
+
+void App::draw_task() {
+  if (task_.state == Task::Idle) return;
+  const double t = now_seconds();
+  if (task_.state == Task::Done && t - task_.since > 15) {
+    task_ = Task{};
+    return;
+  }
+  auto cancel = [&] {
+    if (task_.state == Task::Finding || task_.state == Task::Ready)
+      outbox_.push_back({task_.client, {{"type", "act-cancel"}, {"seq", task_.seq}, {"tabId", task_.tab}}});
+    task_ = Task{};
+  };
+  const bool ready = task_.state == Task::Ready;
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, hexv(ready && task_.warn ? 0x3A1A22 : 0x15233A));
+  ImGui::BeginChild("##task", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+  ImGui::PushFont(small_, small_->LegacySize);
+  ImGui::TextColored(hexv(0x7FD6FF), "%s", task_.command.c_str());
+  if (task_.steps.size() > 1 && task_.state != Task::Done && task_.state != Task::Failed) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("   step %zu of %zu", task_.at + 1, task_.steps.size());
+  }
+  for (const auto& [text, ok] : task_.log)
+    ImGui::TextColored(hexv(ok ? 0x8BF5A6 : 0xFF8A6B), "%s %s", ok ? "done:" : "not done:", text.c_str());
+  ImGui::PopFont();
+
+  bool closed = false;
+  switch (task_.state) {
+    case Task::Waiting:
+    case Task::Finding:
+      ImGui::TextDisabled("%s: the spider is looking for it...", step_text(task_.steps[task_.at]).c_str());
+      if (ImGui::SmallButton("Cancel")) closed = true;
+      break;
+    case Task::Ready:
+      ImGui::TextWrapped("%s?", task_.desc.c_str());
+      if (task_.warn)
+        ImGui::TextColored(hexv(0xFF8A6B), "Careful: this may spend money, send something, or can't be undone. Look at the page first.");
+      ImGui::PushStyleColor(ImGuiCol_Button, hexv(0x2E7D4F));
+      ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hexv(0x379660));
+      if (ImGui::Button("Do it")) {
+        task_.state = Task::Doing;
+        task_.since = t;
+        outbox_.push_back({task_.client, {{"type", "act-go"}, {"seq", task_.seq}, {"tabId", task_.tab}}});
+      }
+      ImGui::PopStyleColor(2);
+      ImGui::SameLine();
+      if (ImGui::Button("Cancel")) closed = true;
+      ImGui::PushFont(small_, small_->LegacySize);
+      ImGui::TextDisabled("The spider holds it on the page. Nothing is clicked or typed until you press Do it.");
+      ImGui::PopFont();
+      break;
+    case Task::Doing:
+      ImGui::TextDisabled("Doing it...");
+      break;
+    case Task::Done:
+      ImGui::TextColored(hexv(0x8BF5A6), "Done.");
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Close")) closed = true;
+      break;
+    case Task::Failed:
+      ImGui::TextColored(hexv(0xFFC46B), "%s", task_.note.c_str());
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Close")) closed = true;
+      break;
+    default:
+      break;
+  }
+  ImGui::EndChild();
+  ImGui::PopStyleColor();
+  if (closed) cancel();
 }
 
 void App::send_spider(bool on) {
@@ -1376,14 +1771,16 @@ void App::draw_header() {
     ImGui::SetKeyboardFocusHere();
     focus_goal_ = false;
   }
-  const bool enter = ImGui::InputTextWithHint("##goal", "What are you looking for? Type it and the spider hunts for it.", goal_,
+  const bool enter = ImGui::InputTextWithHint("##goal", "What are you looking for? Or tell it: click Sign in", goal_,
                                               sizeof(goal_), ImGuiInputTextFlags_EnterReturnsTrue);
   if (ImGui::IsItemEdited()) {
     goal_dirty_ = true;
     goal_edit_at_ = now_seconds();
   }
   // Words are hunted while you type; a question waits until you stop, so half a question is not answered.
+  // A command waits for Enter: half of one ("click sign") must not send the spider to the wrong thing.
   const double pause = ask_kind(goal_) == Ask::None ? 0.7 : 1.6;
+  if (goal_dirty_ && !enter && now_seconds() - goal_edit_at_ > pause && !parse_task(goal_).empty()) goal_dirty_ = false;
   if (enter || (goal_dirty_ && now_seconds() - goal_edit_at_ > pause)) {
     goal_dirty_ = false;
     goal_force_ = enter;
@@ -1408,6 +1805,7 @@ void App::draw_header() {
                         on ? (terms_.empty() ? "   (spider on)" : "   (spider hunting)") : "");
   ImGui::PopFont();
   if (!notice_.empty() && now_seconds() - notice_at_ < 6) ImGui::TextColored(hexv(0xFFC46B), "%s", notice_.c_str());
+  draw_task();
   ImGui::Spacing();
 }
 

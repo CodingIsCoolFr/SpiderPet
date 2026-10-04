@@ -46,6 +46,10 @@ class Checker {
   // Things floating over a page ({key, tag, role, classes, cover, text, buttons}):
   // which are popups to tuck away. -> {key: {action: hide|keep, kind, why}}. Null without the model.
   nlohmann::json blockers(const nlohmann::json& items);
+  // Which of the page's buttons, links and boxes ({i, kind, label, href, inView})
+  // the user means by `want` ("Click the first video"). -> {index, why}; index -1
+  // when none fits. Null without the model. The user still confirms before anything happens.
+  nlohmann::json pick(const std::string& want, const nlohmann::json& items);
   // One sentence, up to three key points, and what kind of page it is.
   nlohmann::json gist(const std::string& title, const std::string& url, const std::string& text);
   // True for a while after the model got squeezed out of the graphics card

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SpiderPet",
-  "version": "3.2.1",
+  "version": "3.3.0",
   "description": "A spider that crawls the page, harvests DOIs, ISBNs, titles and key facts, and checks them with your local AI.",
   "browser_specific_settings": {
     "gecko": {

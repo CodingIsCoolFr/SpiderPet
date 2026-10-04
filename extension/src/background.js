@@ -140,6 +140,14 @@ function fromApp(m) {
     case 'reveal':
       reveal(cleanUrl(m.url), m.id);
       break;
+    case 'act':
+      doAct(m);
+      break;
+    case 'act-pick':
+    case 'act-go':
+    case 'act-cancel':
+      if (m.tabId != null) sendTab(m.tabId, m);
+      break;
     case 'error':
       app.error = m.text || 'SpiderPet reported a problem.';
       break;
@@ -243,6 +251,50 @@ async function reveal(url, id) {
   }
 }
 
+// A command you typed in the app. Moving the tab (go to, back, forward,
+// reload) is done here; clicking and typing go to the spider on the page,
+// which waits for your "Do it" in the app before it touches anything.
+async function doAct(m) {
+  const tabId = m.tabId ?? current?.tabId;
+  const step = m.step || {};
+  const done = (ok, note) => toApp({ type: 'act-done', seq: m.seq, tabId, ok, note });
+  if (tabId == null) return done(false, 'no tab is open.');
+  try {
+    if (step.verb === 'goto') {
+      const url = String(step.url || '');
+      if (!/^https?:\/\//.test(url)) return done(false, 'that is not a web address.');
+      await api.tabs.update(tabId, { url });
+      return done(true, 'opened ' + url);
+    }
+    if (step.verb === 'back') {
+      await api.tabs.goBack(tabId);
+      return done(true, 'went back');
+    }
+    if (step.verb === 'forward') {
+      await api.tabs.goForward(tabId);
+      return done(true, 'went forward');
+    }
+    if (step.verb === 'reload') {
+      await api.tabs.reload(tabId);
+      return done(true, 'reloaded the page');
+    }
+    await whenLoaded(tabId);
+    if (!(await injectSpider(tabId))) return done(false, "the spider can't go on this page.");
+    sendTab(tabId, { ...m, tabId });
+  } catch (e) {
+    done(false, String(e?.message || e));
+  }
+}
+
+// After a click opened a new page, the next step waits for it to finish loading.
+async function whenLoaded(tabId) {
+  for (let i = 0; i < 60; i++) {
+    const tab = await api.tabs.get(tabId);
+    if (tab.status === 'complete') return;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
 // The spider follows you to the next page in the same tab, even after the
 // browser put this script to sleep.
 function saveSpiderTabs() {
@@ -296,6 +348,11 @@ api.runtime.onMessage.addListener((m, sender, reply) => {
       return false;
     case 'check':
       toApp({ type: 'check', id: m.id });
+      return false;
+    case 'act-ready':
+    case 'act-ask':
+    case 'act-done':
+      toApp({ ...m, tabId, url: cleanUrl(sender.tab?.url || '') });
       return false;
     case 'blockers':
       // Things floating over the page: the app's AI says which are popups.
