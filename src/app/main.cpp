@@ -214,7 +214,13 @@ std::string quick_answer(Ask kind, const std::string& goal, const std::string& t
   const std::vector<std::string> sents = sentences_of(text);
   if (kind == Ask::About) {
     std::string out = title.empty() ? "" : "\"" + title + "\". ";
-    if (desc.size() >= 40) return out + desc;
+    if (desc.size() >= 40) {
+      // Many pages (GitHub, shops) put the same words in the title and the description: say them once.
+      const std::string t = plain(title), d = plain(desc);
+      if (t.find(d.substr(0, 40)) != std::string::npos || d.find(t.substr(0, std::min<size_t>(40, t.size()))) != std::string::npos)
+        return desc;
+      return out + desc;
+    }
     for (size_t i = 0; i < sents.size() && i < 2; ++i) out += sents[i] + " ";
     return out.empty() ? "The page has too little text to say." : out;
   }
