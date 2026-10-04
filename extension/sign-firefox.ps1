@@ -73,20 +73,36 @@ function PostFile($url, $field, $path, $type, $extra) {
   $req.Content = $form
   $res = $client.SendAsync($req).Result
   $text = $res.Content.ReadAsStringAsync().Result
+  # Too many uploads in a row: Mozilla says how long to wait. Wait, then go again.
+  if ([int]$res.StatusCode -eq 429 -and $text -match 'available in (\d+) seconds') {
+    Write-Host "Mozilla asks to wait $($Matches[1]) seconds..."
+    Start-Sleep ([int]$Matches[1] + 2)
+    return PostFile $url $field $path $type $extra
+  }
   if (-not $res.IsSuccessStatusCode) { throw "Upload to $url failed ($([int]$res.StatusCode)): $text" }
   $text | ConvertFrom-Json
 }
 
-Write-Host "Uploading SpiderPet $version to Mozilla ($channel)..."
-$upload = PostFile "$api/upload/" "upload" $zip "application/zip" @{ channel = $channel }
-Write-Host "Mozilla is checking it..."
-do {
-  Start-Sleep 3
-  $upload = Call Get "$api/upload/$($upload.uuid)/"
-} until ($upload.processed)
-if (-not $upload.valid) {
-  $upload.validation.messages | Where-Object { $_.type -eq "error" } | ForEach-Object { Write-Host " - $($_.message)" }
-  throw "Mozilla's validator rejected the extension."
+# Does Mozilla have SpiderPet already, and this version of it?
+$exists = $true
+try { Call Get "$api/addon/$g/" | Out-Null } catch { $exists = $false }
+$have = $false
+if ($exists) { $have = [bool]((Call Get "$api/addon/$g/versions/?filter=all_with_unlisted").results | Where-Object { $_.version -eq $version }) }
+
+if ($have) {
+  Write-Host "Mozilla already has SpiderPet $version. Updating its store page..."
+} else {
+  Write-Host "Uploading SpiderPet $version to Mozilla ($channel)..."
+  $upload = PostFile "$api/upload/" "upload" $zip "application/zip" @{ channel = $channel }
+  Write-Host "Mozilla is checking it..."
+  do {
+    Start-Sleep 3
+    $upload = Call Get "$api/upload/$($upload.uuid)/"
+  } until ($upload.processed)
+  if (-not $upload.valid) {
+    $upload.validation.messages | Where-Object { $_.type -eq "error" } | ForEach-Object { Write-Host " - $($_.message)" }
+    throw "Mozilla's validator rejected the extension."
+  }
 }
 
 # What the store page says. Mozilla asks add-ons that need other software to say so up front.
@@ -121,14 +137,9 @@ $listing = @{
 }
 
 # The first time creates the add-on; later times add a version.
-$exists = $true
-try { Call Get "$api/addon/$g/" | Out-Null } catch { $exists = $false }
 if ($exists) {
   if (-not $Private) { Call Patch "$api/addon/$g/" $listing | Out-Null }
-  # Run twice (say, after a hiccup further down): Mozilla already has this version.
-  $have = (Call Get "$api/addon/$g/versions/?filter=all_with_unlisted").results | Where-Object { $_.version -eq $version }
-  if ($have) { Write-Host "Mozilla already has version $version; checking on it." }
-  else { Call Post "$api/addon/$g/versions/" @{ upload = $upload.uuid; license = "MIT" } | Out-Null }
+  if (-not $have) { Call Post "$api/addon/$g/versions/" @{ upload = $upload.uuid; license = "MIT" } | Out-Null }
 } else {
   $body = if ($Private) { @{} } else { $listing.Clone() }
   $body.version = @{ upload = $upload.uuid; license = "MIT" }
@@ -139,13 +150,16 @@ $addon = Call Get "$api/addon/$g/"
 if (-not $Private) {
   try { Call Patch "$api/addon/$g/eula_policy/" @{ privacy_policy = @{ "en-US" = $privacy } } | Out-Null }
   catch { Write-Host "Could not set the privacy policy ($($_.Exception.Message)). Add it on the add-on's edit page." }
-  if (-not $addon.previews -or $addon.previews.Count -eq 0) {
-    foreach ($shot in "page.png", "app.png") {
-      $path = Join-Path $root "docs\media\$shot"
-      if (Test-Path $path) {
-        try { PostFile "$api/addon/$g/previews/" "image" $path "image/png" @{} | Out-Null }
-        catch { Write-Host "Could not add the screenshot $shot ($($_.Exception.Message))." }
-      }
+  # The screenshots the store page does not have yet, in this order.
+  $shots = @("page.png", "app.png")
+  $there = @($addon.previews).Where({ $_ }).Count
+  foreach ($shot in ($shots | Select-Object -Skip $there)) {
+    $path = Join-Path $root "docs\media\$shot"
+    if (Test-Path $path) {
+      try {
+        PostFile "$api/addon/$g/previews/" "image" $path "image/png" @{} | Out-Null
+        Write-Host "Added the screenshot $shot."
+      } catch { Write-Host "Could not add the screenshot $shot ($($_.Exception.Message))." }
     }
   }
 }
@@ -154,8 +168,9 @@ $filter = if ($Private) { "all_with_unlisted" } else { "all_without_unlisted" }
 $all = (Call Get "$api/addon/$g/versions/?filter=$filter").results
 $v = $all | Where-Object { $_.version -eq $version } | Select-Object -First 1
 if (-not $v) { $v = $all | Select-Object -First 1 }
-Write-Host "Waiting for Mozilla to sign it..."
-for ($i = 0; $i -lt 60; $i++) {
+# A new version can be signed within minutes; one sent earlier is just looked at.
+if (-not $have) { Write-Host "Waiting for Mozilla to sign it..." }
+for ($i = 0; $i -lt $(if ($have) { 0 } else { 60 }); $i++) {
   if ($v.file.status -eq "public" -and $v.file.url) { break }
   Start-Sleep 5
   $v = Call Get "$api/addon/$g/versions/$($v.id)/"
