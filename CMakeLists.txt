@@ -6,7 +6,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
 endif()
 set(VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "vcpkg triplet")
 
-project(SpiderPet VERSION 2.0.0 LANGUAGES CXX)
+project(SpiderPet VERSION 2.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,6 +21,7 @@ find_package(nlohmann_json CONFIG REQUIRED)
 # Everything except the two front ends, so the simulator runs the real code.
 add_library(spidercore STATIC
   src/core/util.cpp
+  src/core/spell.cpp
   src/see/glyphs.cpp
   src/see/image.cpp
   src/see/ocr.cpp
@@ -28,6 +29,7 @@ add_library(spidercore STATIC
   src/see/vision.cpp
   src/see/window_capture.cpp
   src/see/inspector.cpp
+  src/see/page_text.cpp
   src/page/page.cpp
   src/pet/spider.cpp
   src/pet/pet.cpp

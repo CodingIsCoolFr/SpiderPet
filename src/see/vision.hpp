@@ -13,6 +13,8 @@
 
 namespace sp {
 
+class PageText;
+
 // Watches one rectangle of one window. A capture thread grabs it ~90 times a
 // second and tracks scrolling; a reader thread runs OCR when the view settles.
 // Frames come from Windows.Graphics.Capture of that window when possible, so
@@ -41,6 +43,7 @@ class Vision {
  private:
   void capture_loop();
   void read_loop();
+  bool read_exact(PageText& text, const Frame& f, uint64_t gen, OcrPass& out);
 
   mutable std::mutex mu_;
   std::condition_variable cv_;

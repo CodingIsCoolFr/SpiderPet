@@ -1,8 +1,10 @@
 #include "page/page.hpp"
 
+#include "core/spell.hpp"
 #include "core/util.hpp"
 
 #include <algorithm>
+#include <cwchar>
 #include <cwctype>
 #include <map>
 #include <set>
@@ -204,6 +206,90 @@ bool ends_sentence(const std::wstring& raw) {
   return true;
 }
 
+// List markers: a bullet ends whatever sentence came before it.
+bool is_bullet(const std::wstring& w) {
+  return w.size() == 1 && (w[0] == 0x2022 || w[0] == 0x00B7 || w[0] == 0x25AA || w[0] == 0x25E6 || w[0] == 0x2023 ||
+                           w[0] == 0x25CF || w[0] == 0x25A0 || w[0] == L'*');
+}
+
+// Text that is not what the page says: OCR misreads ("S iders", "IIU6/knowabte-1@2",
+// "2009.Ø8"), or words the spell checker does not know. Exact page text only
+// gets the shape check, since it is what the page really says.
+bool garbled(const std::wstring& t, bool exact) {
+  int tokens = 0, bad = 0, ascii = 0, letters = 0;
+  for (wchar_t c : t)
+    if (std::iswalpha(c)) {
+      ++letters;
+      ascii += c < 128 ? 1 : 0;
+    }
+  const bool latin = letters > 0 && ascii * 10 >= letters * 9;
+  size_t i = 0;
+  while (i < t.size()) {
+    while (i < t.size() && std::iswspace(t[i])) ++i;
+    const size_t a = i;
+    while (i < t.size() && !std::iswspace(t[i])) ++i;
+    if (i == a) continue;
+    std::wstring w = t.substr(a, i - a);
+    while (!w.empty() && std::wcschr(L".,;:!?)]\"'”’", w.back())) w.pop_back();
+    while (!w.empty() && std::wcschr(L"([\"'“‘", w.front())) w.erase(w.begin());
+    if (w.empty()) continue;
+    ++tokens;
+    const int l = count_letters(w), d = count_digits(w);
+    bool odd = false;
+    for (wchar_t c : w) odd |= std::wcschr(L"@|\\{}<>~^_=#", c) != nullptr && c != 0;
+    for (wchar_t c : w) odd |= latin && std::iswalpha(c) && c >= 128 && !exact;  // "Ø" in an English line
+    if (l == 1 && d == 0 && w.size() == 1 && w != L"a" && w != L"A" && w != L"I" && w != L"&") odd = true;
+    if (l >= 2 && d >= 1 && w.size() > 4 && !exact) odd = true;  // "IIU6", "knowabte-1"
+    bad += odd ? 1 : 0;
+  }
+  if (tokens == 0) return true;
+  if (bad >= 3 || bad * 6 > tokens) return true;
+  if (exact) return false;
+  const float miss = misspelled_share(t);
+  return miss > 0.2f;
+}
+
+// A DOI as it should be written, or empty when this cannot be one.
+std::wstring clean_doi(std::wstring d, bool exact) {
+  if (!exact)
+    for (wchar_t& c : d)
+      if (c == 0x00D8 || c == 0x00F8) c = L'0';
+  while (!d.empty() && std::wcschr(L".,;:", d.back())) d.pop_back();
+  if (!d.empty() && d.back() == L')' && d.find(L'(') == std::wstring::npos) d.pop_back();
+  const size_t slash = d.find(L'/');
+  if (d.rfind(L"10.", 0) != 0 || slash == std::wstring::npos || slash < 7 || slash > 12 || slash + 1 >= d.size())
+    return {};
+  for (size_t i = 3; i < slash; ++i)
+    if (!std::iswdigit(d[i]) && d[i] != L'.') return {};
+  for (wchar_t c : d)
+    if (c < 0x21 || c > 0x7E) return {};
+  return d;
+}
+
+// ISBN-10 and ISBN-13 check digits: an OCR slip almost never passes.
+bool valid_isbn(const std::wstring& raw) {
+  std::wstring d;
+  for (wchar_t c : raw)
+    if (std::iswdigit(c) || c == L'X' || c == L'x') d += static_cast<wchar_t>(std::towupper(c));
+  if (d.size() == 10) {
+    int sum = 0;
+    for (int i = 0; i < 10; ++i) {
+      const int v = d[i] == L'X' ? (i == 9 ? 10 : -100) : d[i] - L'0';
+      sum += v * (10 - i);
+    }
+    return sum >= 0 && sum % 11 == 0;
+  }
+  if (d.size() == 13) {
+    int sum = 0;
+    for (int i = 0; i < 13; ++i) {
+      if (d[i] == L'X') return false;
+      sum += (d[i] - L'0') * (i % 2 ? 3 : 1);
+    }
+    return sum % 10 == 0;
+  }
+  return false;
+}
+
 bool starts_upper(const std::wstring& w) {
   for (wchar_t c : w) {
     if (c == L'"' || c == 0x201C || c == L'(' || c == L'\'' || c == 0x2018) continue;
@@ -221,7 +307,116 @@ int color_dist(uint32_t a, uint32_t b) {
 
 float line_font_px(const Rect& box) { return std::max(8.f, box.h / 0.92f); }
 
+// How different two words are, 0 (same) to 1, ignoring case.
+float word_distance(const std::wstring& a, const std::wstring& b) {
+  const size_t n = a.size(), m = b.size();
+  if (n == 0 || m == 0) return 1.f;
+  std::vector<int> prev(m + 1), cur(m + 1);
+  for (size_t j = 0; j <= m; ++j) prev[j] = static_cast<int>(j);
+  for (size_t i = 1; i <= n; ++i) {
+    cur[0] = static_cast<int>(i);
+    for (size_t j = 1; j <= m; ++j) {
+      const int sub = std::towlower(a[i - 1]) == std::towlower(b[j - 1]) ? 0 : 1;
+      cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + sub});
+    }
+    std::swap(prev, cur);
+  }
+  return static_cast<float>(prev[m]) / static_cast<float>(std::max(n, m));
+}
+
 }  // namespace
+
+// When the app could not hand over its text with positions (Chromium is too
+// slow for that), OCR places the words and the page's own text fixes their
+// spelling: the OCR words inside each accessibility node are lined up with
+// the node's real words, and every close match takes the real spelling.
+void Page::correct_words(float y0, float y1) {
+  if (exact_ || facts_.empty()) return;
+  struct Ref {
+    TextLine* line;
+    OcrWord* word;
+  };
+  std::vector<const Fact*> order;
+  for (const Fact& f : facts_)
+    if (!f.text.empty() && f.box.bottom() >= y0 && f.box.y <= y1) order.push_back(&f);
+  // Smallest first: a link's own text beats the paragraph box around it.
+  std::sort(order.begin(), order.end(), [](const Fact* a, const Fact* b) { return a->box.w * a->box.h < b->box.w * b->box.h; });
+  std::set<const OcrWord*> done;
+  std::set<TextLine*> touched;
+  for (const Fact* f : order) {
+    std::vector<std::wstring> toks;
+    {
+      size_t i = 0;
+      while (i < f->text.size() && toks.size() < 400) {
+        while (i < f->text.size() && std::iswspace(f->text[i])) ++i;
+        const size_t a = i;
+        while (i < f->text.size() && !std::iswspace(f->text[i])) ++i;
+        if (i > a) toks.push_back(f->text.substr(a, i - a));
+      }
+    }
+    std::vector<Ref> ws;
+    const Rect area = f->box.inflated(2.f);
+    for (TextLine& l : lines_) {
+      if (l.box.bottom() < area.y || l.box.y > area.bottom()) continue;
+      for (OcrWord& w : l.words)
+        if (!done.count(&w) && area.contains(w.box.center())) ws.push_back({&l, &w});
+    }
+    if (toks.empty() || ws.empty() || ws.size() > 400) continue;
+    // Line the two word lists up. Words the node does not have (another
+    // element drawn in its box) are skipped at a cost; real words before and
+    // after the visible part (scrolled away) are free to skip.
+    const size_t n = ws.size(), m = toks.size();
+    const float skip_word = 0.6f;
+    std::vector<float> dp((n + 1) * (m + 1), 0.f);
+    std::vector<uint8_t> how((n + 1) * (m + 1), 0);  // 1 match, 2 skip word, 3 skip token
+    auto at = [m](size_t i, size_t j) { return i * (m + 1) + j; };
+    for (size_t i = 1; i <= n; ++i) {
+      dp[at(i, 0)] = dp[at(i - 1, 0)] + skip_word;
+      how[at(i, 0)] = 2;
+    }
+    for (size_t j = 1; j <= m; ++j) how[at(0, j)] = 3;
+    for (size_t i = 1; i <= n; ++i)
+      for (size_t j = 1; j <= m; ++j) {
+        const float d = word_distance(ws[i - 1].word->text, toks[j - 1]);
+        float best = dp[at(i - 1, j - 1)] + d;
+        uint8_t h = 1;
+        if (dp[at(i - 1, j)] + skip_word < best) {
+          best = dp[at(i - 1, j)] + skip_word;
+          h = 2;
+        }
+        // Skipping a real word costs a little inside the visible part.
+        const float skip_tok = (i == n) ? 0.f : 0.35f;
+        if (dp[at(i, j - 1)] + skip_tok < best) {
+          best = dp[at(i, j - 1)] + skip_tok;
+          h = 3;
+        }
+        dp[at(i, j)] = best;
+        how[at(i, j)] = h;
+      }
+    size_t i = n, j = m;
+    while (i > 0 && j > 0) {
+      const uint8_t h = how[at(i, j)];
+      if (h == 1) {
+        OcrWord* w = ws[i - 1].word;
+        if (w->text != toks[j - 1] && word_distance(w->text, toks[j - 1]) <= 0.45f) {
+          w->text = toks[j - 1];
+          touched.insert(ws[i - 1].line);
+        }
+        done.insert(w);
+        --i;
+        --j;
+      } else if (h == 2) {
+        --i;
+      } else {
+        --j;
+      }
+    }
+  }
+  for (TextLine* l : touched) {
+    l->text.clear();
+    for (const OcrWord& w : l->words) l->text += (l->text.empty() ? L"" : L" ") + w.text;
+  }
+}
 
 void Page::clear() {
   facts_.clear();
@@ -260,6 +455,7 @@ int Page::harvested() const {
 void Page::merge_facts(std::vector<Fact> facts, float y0, float y1) {
   std::erase_if(facts_, [&](const Fact& f) { return f.box.center().y >= y0 && f.box.center().y <= y1; });
   for (Fact& f : facts) facts_.push_back(std::move(f));
+  correct_words(y0, y1);
   std::vector<Entity> found;
   extract(y0, y1, found);
   reconcile(found, y0, y1, nullptr);
@@ -299,6 +495,7 @@ void Page::shift(float dy) {
 }
 
 float Page::merge(const OcrPass& pass, const std::function<bool(const Rect&)>& visible) {
+  exact_ = pass.exact;
   const float scroll = static_cast<float>(pass.scroll);
   const float y0 = scroll + 2.f;
   const float y1 = scroll + static_cast<float>(pass.h) - 2.f;
@@ -314,13 +511,20 @@ float Page::merge(const OcrPass& pass, const std::function<bool(const Rect&)>& v
     }
     TextLine l;
     l.text = src.text;
+    l.raw = src.text;
     l.box = src.box.moved(0, scroll);
     l.fg = src.fg;
     l.bg = src.bg;
+    bool fixed = false;
     for (const OcrWord& w : src.words) {
       OcrWord cw = w;
       cw.box.y += scroll;
+      if (!pass.exact) fixed |= repair_ocr_word(cw.text);  // "predatorsv" -> "predators,"
       l.words.push_back(std::move(cw));
+    }
+    if (fixed) {
+      l.text.clear();
+      for (const OcrWord& w : l.words) l.text += (l.text.empty() ? L"" : L" ") + w.text;
     }
     if (visible && !visible(l.box)) continue;
     fresh.push_back(std::move(l));
@@ -361,10 +565,10 @@ float Page::merge(const OcrPass& pass, const std::function<bool(const Rect&)>& v
     std::vector<float> dys;
     const float window = std::max(40.f, line_h_ * 3.f);
     for (const TextLine& n : fresh) {
-      if (n.text.size() < 12) continue;
+      if (n.raw.size() < 12) continue;
       float best = 1e9f;
       for (const TextLine& o : lines_) {
-        if (o.text != n.text || std::fabs(o.box.x - n.box.x) > 6.f) continue;
+        if (o.raw != n.raw || std::fabs(o.box.x - n.box.x) > 6.f) continue;
         const float dy = n.box.y - o.box.y;
         if (std::fabs(dy) < window && std::fabs(dy) < std::fabs(best)) best = dy;
       }
@@ -390,6 +594,7 @@ float Page::merge(const OcrPass& pass, const std::function<bool(const Rect&)>& v
     return a.box.y != b.box.y ? a.box.y < b.box.y : a.box.x < b.box.x;
   });
 
+  correct_words(y0, y1);
   rebuild_stats();
   build_blocks();
   std::vector<Entity> found;
@@ -676,6 +881,12 @@ void Page::extract_line(const TextLine& line, bool prose, std::vector<Entity>& o
     if (a < 0 || b >= n || a > b) return;
     for (int i = a; i <= b; ++i)
       if (used[i]) return;
+    // Only finds that are really what they claim to be.
+    if (k == Kind::Doi) {
+      text = clean_doi(trim(text), exact_);
+      if (text.empty()) return;
+    }
+    if (k == Kind::Isbn && !valid_isbn(text)) return;
     for (int i = a; i <= b; ++i) used[i] = true;
     // The external-link arrow sometimes reads as a stray accented letter glued
     // to the last word ("Spidersö"): drop a lone non-ASCII tail on ASCII text.
@@ -928,7 +1139,11 @@ void Page::extract_sentences(const Block& b, std::vector<Entity>& out) const {
   int start = 0, index = 0;
   for (int k = 0; k < static_cast<int>(words.size()); ++k) {
     const bool last = k + 1 == static_cast<int>(words.size());
-    if (!last) {
+    if (is_bullet(words[k].w->text)) {  // a list item starts here
+      start = k + 1;
+      continue;
+    }
+    if (!last && !is_bullet(words[k + 1].w->text)) {
       // Look past footnote marks ("[4][5]") to the next real word.
       int nx = k + 1;
       while (nx < static_cast<int>(words.size()) && is_ref_token(words[nx].w->text)) ++nx;
@@ -967,9 +1182,26 @@ void Page::extract_sentences(const Block& b, std::vector<Entity>& out) const {
           lt.find(L" was a ") != std::wstring::npos)
         s += 0.35f;
       if (t.back() == L':') s -= 0.6f;
+      // A sentence ends like one. Code, menus and lines cut off mid-thought do not.
+      if (!std::wcschr(L".!?\x2026\"\x201D')", t.back())) s = -10.f;
       // Reference-list entries are data to harvest, not prose to read.
       const wchar_t first = t.empty() ? 0 : t[0];
       if (first == L'"' || first == 0x201C || first == L'^') s = -10.f;
+      // "Harland, D.P. & Jackson, R.R. (2000)": authors, initials and a year.
+      {
+        int initials = 0;
+        for (size_t i = 0; i + 2 < t.size(); ++i)
+          initials += std::iswupper(t[i]) && t[i + 1] == L'.' && (i == 0 || !std::iswalpha(t[i - 1])) ? 1 : 0;
+        bool year = false;
+        for (size_t i = 0; i + 5 < t.size(); ++i)
+          year |= t[i] == L'(' && std::iswdigit(t[i + 1]) && std::iswdigit(t[i + 4]) && t[i + 5] == L')';
+        if (year && initials >= 2) s = -10.f;
+      }
+      // Site furniture, not what the page is about.
+      for (const wchar_t* chrome : {L"cookie", L"sign in", L"log in", L"subscribe", L"all rights reserved",
+                                    L"privacy policy", L"terms of use", L"terms of service", L"javascript", L"skip to"})
+        if (lt.find(chrome) != std::wstring::npos) s = -10.f;
+      if (s > 0 && garbled(t, exact_)) s = -10.f;
       for (const wchar_t* cite : {L"retrieved ", L"archived ", L"(pdf)", L"doi:", L"isbn", L"pmid", L"et al.", L"http", L"www."})
         if (lt.find(cite) != std::wstring::npos) s = -10.f;
       int caps = 0, ws = 0;

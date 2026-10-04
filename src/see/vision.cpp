@@ -2,6 +2,7 @@
 
 #include "core/util.hpp"
 #include "see/ocr.hpp"
+#include "see/page_text.hpp"
 #include "see/scroll.hpp"
 #include "see/window_capture.hpp"
 
@@ -223,9 +224,44 @@ void Vision::capture_loop() {
   cap.stop();
 }
 
+// The words the app itself publishes (browsers, Electron, Word, editors):
+// exact text and exact word boxes, so nothing is guessed from pixels. The
+// pixels still decide colors and drop words that are not actually drawn.
+bool Vision::read_exact(PageText& text, const Frame& f, uint64_t gen, OcrPass& out) {
+  HWND window;
+  RECT area;
+  {
+    std::lock_guard lock(mu_);
+    window = window_;
+    area = rect_;
+  }
+  const double t0 = now_seconds();
+  std::vector<OcrLine> lines;
+  PageText::Stats st;
+  // Most of the area must be the document, or OCR sees more than it does.
+  if (!text.read(window, area, lines, &st) || st.cover < 0.5f || st.words < 8) return false;
+  {
+    // The boxes are where the words are now; the frame is from just before.
+    // If anything moved in between they do not belong together.
+    std::lock_guard lock(mu_);
+    if (gen != gen_ || !EqualRect(&area, &rect_) || st_.scroll != f.scroll || st_.last_motion > f.time) {
+      read_requested_ = true;
+      return false;
+    }
+  }
+  int dropped = 0;
+  if (!exact_pass(lines, area, f, out, &dropped)) return false;
+  out.took = now_seconds() - t0;
+  debug_log("page text: " + std::to_string(st.words) + " words, " + std::to_string(dropped) + " not drawn, " +
+            std::to_string(st.calls) + " calls, " + std::to_string(static_cast<int>(st.took * 1000)) + " ms");
+  return true;
+}
+
 void Vision::read_loop() {
   join_mta();
   TextReader reader;
+  PageText page_text;
+  uint64_t text_gen = 0;
   reader_ready_ = reader.ready();
   if (!reader.ready()) debug_log("ocr engine unavailable");
   while (!quit_) {
@@ -253,8 +289,19 @@ void Vision::read_loop() {
       gen = snapshot_gen_;
       have_snapshot_ = false;
     }
+    if (gen != text_gen) {  // a new page or tab: find its document again
+      page_text.forget();
+      text_gen = gen;
+    }
     OcrPass pass;
-    if (!reader.read(f, pass)) continue;
+    if (!read_exact(page_text, f, gen, pass)) {
+      bool moved = false;
+      {
+        std::lock_guard lock(mu_);
+        moved = read_requested_;
+      }
+      if (moved || !reader.read(f, pass)) continue;
+    }
     pass.generation = gen;
     pass.fixed = std::move(f.fixed);
     std::lock_guard lock(mu_);

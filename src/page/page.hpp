@@ -57,6 +57,7 @@ struct Fact {
 
 struct TextLine {
   std::wstring text;
+  std::wstring raw;            // what OCR read, before any correction (drift matching)
   Rect box;
   std::vector<OcrWord> words;  // content coordinates
   uint32_t fg = 0;
@@ -103,6 +104,7 @@ class Page {
     bool prose = false;
   };
   void rebuild_stats();
+  void correct_words(float y0, float y1);
   void build_blocks();
   void extract(float y0, float y1, std::vector<Entity>& out) const;
   void extract_line(const TextLine& line, bool prose, std::vector<Entity>& out) const;
@@ -128,6 +130,7 @@ class Page {
   uint32_t paper_ = 0x101010;
   uint32_t ink_ = 0xE0E0E0;
   float column_x_ = 0;
+  bool exact_ = false;  // the text came from the app itself, not OCR
 };
 
 }  // namespace sp

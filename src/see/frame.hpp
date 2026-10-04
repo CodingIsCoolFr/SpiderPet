@@ -50,6 +50,7 @@ struct OcrPass {
   double time = 0;
   double took = 0;
   uint64_t generation = 0;  // target generation the frame belongs to
+  bool exact = false;       // the app's own text, not OCR guesses
   std::vector<uint8_t> fixed;
   std::shared_ptr<const Frame> image;  // the pixels that were read
 };

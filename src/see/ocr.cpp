@@ -64,9 +64,11 @@ int color_dist(uint32_t a, uint32_t b) {
   return std::abs(dr) + std::abs(dg) + std::abs(db);
 }
 
+}  // namespace
+
 // Background = the most common color in a thin ring around the box.
 // Foreground = the average of the pixels inside that differ most from it.
-void sample_colors(const Frame& f, const Rect& box, uint32_t& fg, uint32_t& bg) {
+int sample_colors(const Frame& f, const Rect& box, uint32_t& fg, uint32_t& bg) {
   const int x0 = std::clamp(static_cast<int>(box.x) - 2, 0, f.w - 1);
   const int y0 = std::clamp(static_cast<int>(box.y) - 2, 0, f.h - 1);
   const int x1 = std::clamp(static_cast<int>(box.right()) + 2, 0, f.w - 1);
@@ -96,7 +98,7 @@ void sample_colors(const Frame& f, const Rect& box, uint32_t& fg, uint32_t& bg) 
     for (int x = x0 + 2; x <= x1 - 2; ++x) max_d = std::max(max_d, color_dist(to_rgb(f.at(x, y)), bg));
   if (max_d < 40) {
     fg = luma(bg) < 0.5f ? 0xE8E8E8 : 0x202020;
-    return;
+    return max_d;
   }
   uint64_t r = 0, g = 0, b = 0, n = 0;
   const int cut = max_d * 3 / 5;
@@ -110,9 +112,8 @@ void sample_colors(const Frame& f, const Rect& box, uint32_t& fg, uint32_t& bg) 
       ++n;
     }
   fg = n ? static_cast<uint32_t>((r / n) << 16 | (g / n) << 8 | (b / n)) : 0xE8E8E8;
+  return max_d;
 }
-
-}  // namespace
 
 bool TextReader::read(const Frame& frame, OcrPass& out) {
   if (!impl_->engine || frame.w < 16 || frame.h < 16) return false;

@@ -1,5 +1,6 @@
 // SpiderTool: console helper for testing without touching the real desktop.
 //   SpiderTool ocr <image> [y] [h]    dump what the reader sees in a slice
+//   SpiderTool text <title part>      exact page text vs OCR on a live window (read only)
 #include "core/util.hpp"
 #include "see/image.hpp"
 #include "see/ocr.hpp"
@@ -9,6 +10,11 @@
 #include "render/paint.hpp"
 #include "render/scene.hpp"
 #include "see/scroll.hpp"
+#include "see/inspector.hpp"
+#include "see/page_text.hpp"
+#include "see/window_capture.hpp"
+
+#include <dwmapi.h>
 
 #include <windows.h>
 
@@ -346,11 +352,140 @@ static int run_view(int argc, wchar_t** argv) {
   return 0;
 }
 
+// SpiderTool text <part of a window title> [lines]
+// Reads a live window two ways, the published page text and OCR of its
+// pixels, and prints both with timings. Only reads; never clicks or types.
+static int run_text(int argc, wchar_t** argv) {
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  struct Find {
+    std::wstring part;
+    HWND hwnd = nullptr;
+  } find{lower(argv[2])};
+  EnumWindows(
+      [](HWND h, LPARAM lp) -> BOOL {
+        auto* f = reinterpret_cast<Find*>(lp);
+        wchar_t t[512];
+        if (!IsWindowVisible(h) || !GetWindowTextW(h, t, 512)) return TRUE;
+        if (lower(t).find(f->part) == std::wstring::npos) return TRUE;
+        f->hwnd = h;
+        return FALSE;
+      },
+      reinterpret_cast<LPARAM>(&find));
+  if (!find.hwnd) {
+    std::printf("no window with that title\n");
+    return 1;
+  }
+  const int show = argc > 3 ? _wtoi(argv[3]) : 25;
+  RECT area;
+  GetClientRect(find.hwnd, &area);
+  MapWindowPoints(find.hwnd, nullptr, reinterpret_cast<POINT*>(&area), 2);
+
+  // Pixels first, then the page text right away, as the live reader does.
+  WindowCapture::allow_borderless();
+  WindowCapture cap;
+  if (!cap.start(find.hwnd)) return 1;
+  RECT frame{};
+  DwmGetWindowAttribute(find.hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame));
+  const RECT region{area.left - frame.left, area.top - frame.top, area.right - frame.left, area.bottom - frame.top};
+  Frame f;
+  for (int i = 0; i < 100 && !cap.grab(region, f.px, f.w, f.h); ++i) Sleep(20);
+  cap.stop();
+  if (f.w == 0) return 1;
+
+  PageText pt;
+  std::vector<OcrLine> lines;
+  PageText::Stats st;
+  if (!pt.read(find.hwnd, area, lines, &st)) {  // Chromium builds its tree on the first ask
+    pt.forget();
+    Sleep(1500);
+  }
+  const bool ok = pt.read(find.hwnd, area, lines, &st);  // second read: document cached, the steady state
+  if (std::getenv("TEXT_PIECES"))  // what the app reported, before the pixels judge it
+    for (size_t i = 0; i < lines.size(); i += std::max<size_t>(1, lines.size() / 60))
+      std::printf("  piece [%5.0f,%5.0f %4.0fx%3.0f] %s\n", lines[i].box.x - area.left, lines[i].box.y - area.top,
+                  lines[i].box.w, lines[i].box.h, utf8(lines[i].text).substr(0, 60).c_str());
+  OcrPass exact;
+  int dropped = 0;
+  const bool have = ok && exact_pass(lines, area, f, exact, &dropped);
+  std::printf("== page text: %s, %d words (%d not drawn), %d calls, %.0f ms, covers %.0f%%\n", have ? "ok" : "none",
+              st.words, dropped, st.calls, st.took * 1000, st.cover * 100);
+  if (std::getenv("TEXT_WORDS"))  // every exact word with its box, frame pixels
+    for (const OcrLine& l : exact.lines)
+      for (const OcrWord& w : l.words)
+        std::printf("  [%4.0f,%4.0f %3.0fx%2.0f] %s\n", w.box.x, w.box.y, w.box.w, w.box.h, utf8(w.text).c_str());
+  TextReader reader;
+  OcrPass ocr;
+  reader.read(f, ocr);
+  std::printf("== ocr: %zu lines, %.0f ms\n", ocr.lines.size(), ocr.took * 1000);
+
+  // What each would put in the harvest.
+  auto harvest = [&](const char* name, const OcrPass& pass) {
+    Page page;
+    wchar_t t[512];
+    GetWindowTextW(find.hwnd, t, 512);
+    page.set_title(t);
+    page.merge(pass, nullptr);
+    std::printf("\n== harvest from %s\n", name);
+    int shown = 0;
+    for (const Entity& e : page.entities()) {
+      if (shown++ >= show) break;
+      const std::string label = e.label.empty() ? "" : utf8(e.label) + " ";
+      const std::string href = e.href.empty() ? "" : "  -> " + utf8(e.href);
+      std::printf("  %-8s %5.0f  %s%s%s\n", kind_name(e.kind), e.box.y, label.c_str(), utf8(e.text).substr(0, 140).c_str(),
+                  href.c_str());
+    }
+  };
+  if (have) harvest("page text", exact);
+  harvest("ocr", ocr);
+
+  // OCR corrected by the page tree: the path for windows too slow to read exactly.
+  Inspector insp;
+  insp.start();
+  insp.inspect(find.hwnd, {(area.left + area.right) / 2, (area.top + area.bottom) / 2}, 1);
+  Inspector::Result res;
+  for (int i = 0; i < 300 && !insp.take(res); ++i) Sleep(10);
+  Inspector::Scan scan;
+  if (res.found) {
+    insp.scan(find.hwnd, 2);
+    for (int i = 0; i < 600 && !insp.take_scan(scan); ++i) Sleep(10);
+  }
+  insp.stop();
+  std::vector<Fact> facts;
+  for (const Inspector::Node& nd : scan.nodes) {
+    Fact fc;
+    fc.type = static_cast<Fact::Type>(nd.type);
+    fc.text = nd.text;
+    fc.url = nd.url;
+    fc.level = nd.level;
+    fc.box = {static_cast<float>(nd.rect.left - area.left), static_cast<float>(nd.rect.top - area.top),
+              static_cast<float>(nd.rect.right - nd.rect.left), static_cast<float>(nd.rect.bottom - nd.rect.top)};
+    facts.push_back(std::move(fc));
+  }
+  std::printf("\n== page tree: %zu nodes in %.0f ms\n", scan.nodes.size(), scan.took * 1000);
+  {
+    Page page;
+    wchar_t t[512];
+    GetWindowTextW(find.hwnd, t, 512);
+    page.set_title(t);
+    page.merge(ocr, nullptr);
+    page.merge_facts(std::move(facts), 0, static_cast<float>(f.h));
+    std::printf("== harvest from ocr + page tree\n");
+    int shown = 0;
+    for (const Entity& e : page.entities()) {
+      if (shown++ >= show) break;
+      const std::string label = e.label.empty() ? "" : utf8(e.label) + " ";
+      std::printf("  %-8s %5.0f  %s%s\n", kind_name(e.kind), e.box.y, label.c_str(), utf8(e.text).substr(0, 140).c_str());
+    }
+  }
+  return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
   SetConsoleOutputCP(CP_UTF8);
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   join_mta();
   if (argc >= 3 && std::wstring(argv[1]) == L"ocr") return run_ocr(argc, argv);
+  if (argc >= 3 && std::wstring(argv[1]) == L"text") return run_text(argc, argv);
   if (argc >= 3 && std::wstring(argv[1]) == L"page") return run_page(argc, argv);
   if (argc >= 3 && std::wstring(argv[1]) == L"scroll") return run_scroll(argc, argv);
   if (argc >= 4 && std::wstring(argv[1]) == L"sim") return run_sim(argc, argv);

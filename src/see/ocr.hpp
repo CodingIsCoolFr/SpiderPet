@@ -24,4 +24,8 @@ class TextReader {
 
 void join_mta();  // winrt::init_apartment(multi_threaded), safe to call twice
 
+// Paper and ink colors of a box in a frame (0xRRGGBB). Returns the strongest
+// ink contrast found; under ~40 there is no text drawn there at all.
+int sample_colors(const Frame& f, const Rect& box, uint32_t& fg, uint32_t& bg);
+
 }  // namespace sp

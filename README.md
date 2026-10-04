@@ -54,7 +54,11 @@
 
 ## Browser mode
 
-Browsers publish a structured copy of every page for screen readers. SpiderPet reads it straight from the browser, in C++, with no extension to install: exact text, real headings, and the **web address of every link** — so a harvested link comes with where it goes. It works in Firefox, Chrome, Brave and Edge. Everywhere else (chat apps, PDFs, documents) it reads the window with Windows OCR.
+Browsers publish a structured copy of every page for screen readers. SpiderPet reads it straight from the browser, in C++, with no extension to install: exact text, real headings, and the **web address of every link** — so a harvested link comes with where it goes.
+
+- **Firefox:** the spider reads the page's own words, line by line, with their exact positions. Nothing is guessed from pixels, so every DOI, title and sentence is spelled exactly as on the page. Text the page carries but does not show (screen-reader labels, hidden menus) is left out.
+- **Chrome, Brave and Edge:** these answer too slowly for a full read of every line, so the spider reads the pixels and then corrects each word against the page's own text.
+- **Everywhere else** (chat apps, PDFs, documents) it reads the window with Windows OCR. The Windows spell checker repairs the usual misreads ("predatorsv" → "predators,") and drops sentences that came out garbled.
 
 ## How it works
 
@@ -63,7 +67,7 @@ Browsers publish a structured copy of every page for screen readers. SpiderPet r
 </p>
 
 - **Seeing.** It captures only the window it is on (Windows.Graphics.Capture), so it never reads itself and still shows up in your screen shares. A scroll tracker matches row profiles between frames and keeps everything glued to the text while you scroll.
-- **Reading.** Windows OCR turns pixels into words with exact positions. Lines become blocks, blocks become sentences, and typed finds are pulled out: DOIs, ISBNs, PMIDs, Bibcodes, titles in quotes, links by color or by the page's own link list, table rows, cards.
+- **Reading.** The app's own text when it publishes it (UI Automation's text pattern), Windows OCR when it does not. The pixels place each word and give its colors. Lines become blocks, blocks become sentences, and typed finds are pulled out: DOIs, ISBNs, PMIDs, Bibcodes, titles in quotes, links by color or by the page's own link list, table rows, cards.
 - **Choosing.** Each find has a value; distance, reading order and how much it already ate nearby decide what comes next.
 - **Moving.** FABRIK inverse kinematics for the legs, a stepping gait that plants feet on glyphs, bursts of speed like a real spider.
 - **Drawing.** A topmost, click-through Direct2D window composed with DirectComposition. It shrinks to the page it is on and steps aside for full-screen games.
@@ -89,7 +93,7 @@ vcpkg install imgui nlohmann-json --triplet x64-windows
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-`build\Release\SpiderTool.exe` is the test bench: `ocr`, `page`, `scroll`, `view` (a scrollable test window) and `sim`, which films the whole pipeline over a page image without touching your screen — every image above was made with it.
+`build\Release\SpiderTool.exe` is the test bench: `ocr`, `page`, `scroll`, `text` (reads a live window as page text, OCR and OCR plus page tree, side by side, without touching it), `view` (a scrollable test window) and `sim`, which films the whole pipeline over a page image without touching your screen — every image above was made with it.
 
 ```
 src/core     math, time, paths
