@@ -143,6 +143,10 @@ function fromApp(m) {
     case 'act':
       doAct(m);
       break;
+    case 'snap':
+      // A task wants a fresh look at the page you are on.
+      snap(m);
+      break;
     case 'act-pick':
     case 'act-go':
     case 'act-cancel':
@@ -286,6 +290,21 @@ async function doAct(m) {
   }
 }
 
+async function snap(m) {
+  const tabId = current?.tabId;
+  const fail = (note) => toApp({ type: 'snap', seq: m.seq, tabId, snap: null, note });
+  if (tabId == null) return fail('no tab is open.');
+  try {
+    await whenLoaded(tabId);
+    const tab = await api.tabs.get(tabId);
+    if (!/^https?:/.test(tab.url || '')) return toApp({ type: 'snap', seq: m.seq, tabId, snap: { url: tab.url || '', title: tab.title || '', text: '', items: [] } });
+    if (!(await injectSpider(tabId))) return fail("the spider can't go on this page.");
+    sendTab(tabId, { ...m, tabId });
+  } catch (e) {
+    fail(String(e?.message || e));
+  }
+}
+
 // After a click opened a new page, the next step waits for it to finish loading.
 async function whenLoaded(tabId) {
   for (let i = 0; i < 60; i++) {
@@ -352,6 +371,7 @@ api.runtime.onMessage.addListener((m, sender, reply) => {
     case 'act-ready':
     case 'act-ask':
     case 'act-done':
+    case 'snap':
       toApp({ ...m, tabId, url: cleanUrl(sender.tab?.url || '') });
       return false;
     case 'blockers':

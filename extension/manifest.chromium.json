@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SpiderPet",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "description": "A spider that crawls the page, harvests DOIs, ISBNs, titles and key facts, and checks them with your local AI.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvYELTGhIIj5AD3ubrte39SE4QBz7w8WJy2DDOtKpX8/A+Jgii8XCmi8ukrczB6yUkgihYNAOUqE1xBJ3cHq4+eS3pmk0lrJh91gDycOcys/vW8N3nqe0mD3FDBK6bslKa7Hv8O+HWUAvQ4GilalN4yzna9G4zoN+IDhj7cJjwzcRwL8McJtRghow/UO0HAVflpfX3EZkMiRKiQmKpu8EVXbLa5m9vXsFrciBpKaeG1KKM5pJzeRlE/77bjY1zzNadb9i/JnwQE9gnjSynVF/pgNRJUyhtmfJxHUJpVtjYbtX52Z7hTrH8lqCUgqk4Kb7whDAEshz8tdiliEFfzCNdwIDAQAB",
   "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "96": "icons/96.png", "128": "icons/128.png" },

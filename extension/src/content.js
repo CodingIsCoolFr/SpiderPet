@@ -1894,20 +1894,73 @@
     }
   }
 
+  function searchBox(el) {
+    return (
+      el.type === 'search' ||
+      el.getAttribute?.('role') === 'searchbox' ||
+      /^(q|query|search|s|search_query|k|keywords?)$/i.test(el.name || '') ||
+      !!el.closest?.('form[role=search], [role=search]') ||
+      /search/i.test(labelOf(el))
+    );
+  }
+
+  // A step the app must not do without your "Do it": it could spend money, send
+  // or post something, sign you up or in, or can't be undone. Searching,
+  // scrolling and opening links are safe.
+  function risky(step, c) {
+    const el = c.el;
+    if (RISKY.test(c.label)) return true;
+    const form = el.form || el.closest?.('form');
+    const searchForm = form && (form.getAttribute('role') === 'search' || [...form.elements].some((x) => searchBox(x)));
+    if (form?.querySelector('input[type=password]')) return true; // logging in or signing up
+    if (step.verb === 'type') return !!step.enter && !searchBox(el);
+    // A form's send button (not a search).
+    const submits = el.matches('button:not([type=button]):not([type=reset]), input[type=submit], input[type=image]');
+    return !!(form && submits && !searchForm);
+  }
+
+  // What the page offers right now, for the AI that plans a task: some of its
+  // text and a numbered list of what can be clicked or typed into.
+  let snapEls = [];
+  function snapshot() {
+    const all = candidates(false);
+    for (const f of candidates(true)) if (!all.some((c) => c.el === f.el)) all.push(f);
+    // On screen first, then the rest in reading order; only things with a name.
+    all.sort((a, b) => (b.inView - a.inView) || a.order - b.order);
+    snapEls = all.filter((c) => c.label || c.kind === 'field').filter((c) => !secret(c.el)).slice(0, 90);
+    const root = mainRoot();
+    const text = squash((root.innerText || document.body.innerText || '').slice(0, 6000)).slice(0, 2500);
+    return {
+      url: pageUrl(),
+      title: document.title,
+      text,
+      scroll: Math.round((scrollY / Math.max(1, document.documentElement.scrollHeight - innerHeight)) * 100) || 0,
+      items: snapEls.map((c, i) => ({
+        i,
+        kind: c.kind,
+        label: c.label,
+        href: c.el.href ? String(c.el.href).slice(0, 90) : '',
+        value: c.kind === 'field' && 'value' in c.el ? String(c.el.value || '').slice(0, 60) : '',
+        inView: c.inView,
+        search: c.kind === 'field' && searchBox(c.el),
+      })),
+    };
+  }
+
   // Lock on to the chosen element: the spider walks there and the app asks you.
   function propose(c) {
     if (!act) return;
     act.el = c.el;
     act.f = { el: c.el, kind: 'act', text: c.label };
     act.desc = describe(act.step, c);
-    act.warn = RISKY.test(c.label) || (act.step.enter && RISKY.test(act.step.what || ''));
+    act.warn = risky(act.step, c);
     const r = c.el.getBoundingClientRect();
     if (r.bottom < 0 || r.top > innerHeight) c.el.scrollIntoView({ block: 'center', behavior: 'smooth' }); // you have to see it to say yes
     target = null;
     tether = { f: act.f, amount: 1, mode: 'travel' };
     readingRange = null;
     if (mode !== 'drop' && mode !== 'held') setMode('act');
-    think(act.desc.toLowerCase() + '? say so in the app.', 30);
+    think(act.desc.toLowerCase() + (act.warn ? '? say yes in the app.' : '…'), 30);
     actReport({ type: 'act-ready', desc: act.desc, warn: act.warn });
   }
 
@@ -1925,6 +1978,13 @@
       return;
     }
     if (step.verb === 'type' && !String(step.text || '')) return actFail('nothing to type.');
+    // A task's step names a thing from the last look at the page by its number.
+    if (step.ref != null) {
+      const c = snapEls[step.ref];
+      if (!c || !c.el.isConnected) return actFail('that thing is gone from the page.');
+      if (step.verb === 'type' && (secret(c.el) || !c.el.matches(FIELD))) return actFail("that isn't a box the spider may type in.");
+      return propose(c);
+    }
     const { want, list } = rankFor(step);
     const best = list[0];
     const second = list[1];
@@ -2091,6 +2151,10 @@
         break;
       case 'act-pick':
         onPick(m);
+        break;
+      case 'snap':
+        think('looking around…');
+        api.runtime.sendMessage({ type: 'snap', seq: m.seq, snap: snapshot() }).catch(() => {});
         break;
       case 'act-go':
         go(m);

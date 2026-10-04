@@ -50,6 +50,11 @@ class Checker {
   // the user means by `want` ("Click the first video"). -> {index, why}; index -1
   // when none fits. Null without the model. The user still confirms before anything happens.
   nlohmann::json pick(const std::string& want, const nlohmann::json& items);
+  // The next step toward a goal, from a look at the page ({url, title, text,
+  // scroll, items: [{i, kind, label, href, value, inView, search}]}) and what was
+  // done so far. -> {action: click|type|scroll|goto|back|done|ask, index, text,
+  // enter, url, dir, say}. Null without the model.
+  nlohmann::json next_action(const std::string& goal, const nlohmann::json& history, const nlohmann::json& snap);
   // One sentence, up to three key points, and what kind of page it is.
   nlohmann::json gist(const std::string& title, const std::string& url, const std::string& text);
   // True for a while after the model got squeezed out of the graphics card

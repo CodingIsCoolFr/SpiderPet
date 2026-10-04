@@ -47,7 +47,7 @@ namespace {
 constexpr UINT kTrayMsg = WM_APP + 1;
 constexpr UINT kShowMsg = WM_APP + 2;
 constexpr UINT kWakeMsg = WM_APP + 3;
-constexpr const char* kVersion = "3.3.0";
+constexpr const char* kVersion = "3.4.0";
 
 ImVec4 hexv(uint32_t c, float a = 1.f) {
   return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
@@ -435,6 +435,42 @@ std::string step_text(const json& s) {
   return "Click " + jstr(s, "what");
 }
 
+// A goal in your own words ("play a cat video on YouTube", "please sign me up
+// for the newsletter"): the local AI plans it step by step on the page.
+// Simple commands ("click Sign in"), searches and questions are not goals.
+bool is_agent_task(const std::string& typed) {
+  std::string g = ascii_lower(trim_cmd(typed));
+  bool polite = false;
+  for (const char* p : {"please ", "can you ", "could you ", "would you ", "will you ", "spider, ", "spider ", "task: ", "do: "})
+    if (g.rfind(p, 0) == 0) {
+      g = g.substr(strlen(p));
+      polite = true;
+    }
+  const std::vector<std::string> w = words_in(g);
+  if (w.size() < 2) return false;
+  if (polite) return true;
+  // Two things to do: "find a cat video and play it", "go to youtube and search cats".
+  static const std::set<std::string> verbs = {
+      "play", "watch", "listen", "buy", "order", "book", "subscribe", "unsubscribe", "download", "reply", "comment",
+      "post", "send", "share", "like", "follow", "unfollow", "star", "apply", "register", "join", "sign", "log", "login",
+      "create", "start", "save", "bookmark", "take", "complete", "finish", "add", "remove", "delete", "cancel", "accept",
+      "decline", "compare", "help", "fill", "click", "open", "search", "type", "pick", "choose", "select", "show", "tell",
+      "read", "go", "find", "get", "check", "scroll", "press", "tap", "visit", "write", "enter", "upvote", "downvote"};
+  for (size_t i = 1; i + 1 < w.size(); ++i)
+    if (w[i] == "and" && verbs.count(w[i + 1]) && w[i + 1] != "go" && w[i + 1] != "get") return true;
+  const std::string& v = w[0];
+  if ((v == "sign" || v == "log") && (w[1] == "in" || w[1] == "up" || w[1] == "out" || w[1] == "me")) return true;
+  if (v == "show" && w[1] == "me") return w.size() >= 3;
+  if (v == "search") return w.size() >= 3 && w[1] != "for" && w[1] != "and";
+  if (v == "take" && w[1] == "me") return true;
+  static const std::set<std::string> starts = {
+      "play", "watch", "listen", "buy", "order", "book", "subscribe", "unsubscribe", "download", "reply", "comment",
+      "post", "send", "share", "like", "follow", "unfollow", "star", "apply", "register", "join", "login", "create",
+      "start", "save", "bookmark", "complete", "finish", "add", "remove", "delete", "cancel", "accept", "decline",
+      "compare", "help", "fill", "upvote", "downvote"};
+  return starts.count(v) && w.size() >= 3;
+}
+
 std::wstring exe_dir() {
   wchar_t path[MAX_PATH];
   GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -508,11 +544,13 @@ class App {
   void start_task(const std::string& command, const json& steps);  // called with mu_ held
   void task_tick();
   void task_stop(const std::string& note);  // called with mu_ held
-  void task_next();                         // the step worked; called with mu_ held
+  void task_next(bool ok = true, const std::string& note = "");  // the step is over; called with mu_ held
+  void start_agent(const std::string& goal);                    // called with mu_ held
+  void agent_step(const json& action, int seq);                 // the AI's next step; called with mu_ held
   void draw_task();                         // called with mu_ held
 
   struct Job {
-    enum Type { Check, Rank, Gist, Expand, Answer, Blockers, Pick } type;
+    enum Type { Check, Rank, Gist, Expand, Answer, Blockers, Pick, Agent } type;
     std::string url, id;
     json data;
   };
@@ -567,7 +605,13 @@ class App {
   void queue_answer();                     // called with mu_ held
   // A command you typed, step by step.
   struct Task {
-    enum State { Idle, Waiting, Finding, Ready, Doing, Done, Failed } state = Idle;
+    enum State { Idle, Waiting, Snapping, Thinking, Finding, Ready, Doing, Done, Failed } state = Idle;
+    bool agent = false;                // a goal the AI plans, not a list of steps you gave
+    int actions = 0, fails = 0;        // a goal: steps taken, failures in a row
+    std::vector<std::string> history;  // a goal: what was done, for the AI
+    std::string say;                   // a goal: the AI's last words (its plan, or the result)
+    bool auto_go = false;              // a safe step: it goes by itself at auto_at
+    double auto_at = 0;
     std::string command;
     json steps = json::array();
     size_t at = 0;
@@ -839,6 +883,25 @@ void App::on_message(int client, const json& raw) {
     }
     return;
   }
+  if (type == "snap") {
+    // A fresh look at the page for the goal: the AI decides the next step.
+    if (m.value("seq", -1) != task_.seq || task_.state != Task::Snapping) return;
+    const json snap = m.value("snap", json());
+    if (!snap.is_object()) {
+      task_stop(jstr(m, "note").empty() ? "The spider can't see this page." : jstr(m, "note"));
+      return;
+    }
+    task_.client = client;
+    task_.tab = m.value("tabId", -1);
+    task_.state = Task::Thinking;
+    task_.since = now_seconds();
+    json hist = json::array();
+    for (const std::string& h : task_.history) hist.push_back(h);
+    urgent_.push_front({Job::Agent, jstr(snap, "url"), "", {{"seq", task_.seq}, {"goal", task_.command}, {"history", hist}, {"snap", snap}}});
+    cv_.notify_all();
+    wake();
+    return;
+  }
   if (type == "act-ready" || type == "act-ask" || type == "act-done") {
     // The spider's answer about the step it was given. Older steps are done with.
     if (m.value("seq", -1) != task_.seq || client != task_.client) return;
@@ -847,6 +910,9 @@ void App::on_message(int client, const json& raw) {
       task_.desc = jstr(m, "desc");
       task_.warn = m.value("warn", false);
       task_.since = now_seconds();
+      // Safe steps go by themselves after a moment (you see the spider hold it); risky ones wait for Do it.
+      task_.auto_go = !task_.warn && !settings_.ask_every_step;
+      task_.auto_at = now_seconds() + 0.9;
     } else if (type == "act-ask" && task_.state == Task::Finding) {
       // Not sure which thing you mean: the AI picks from the page's buttons and links.
       urgent_.push_front({Job::Pick, jstr(m, "url"), "",
@@ -856,8 +922,7 @@ void App::on_message(int client, const json& raw) {
       cv_.notify_all();
     } else if (type == "act-done" && task_.state != Task::Idle && task_.state != Task::Done && task_.state != Task::Failed) {
       const std::string note = jstr(m, "note");
-      if (!m.value("ok", false)) task_stop(note.empty() ? "It did not work." : note);
-      else task_next();
+      task_next(m.value("ok", false), note.empty() ? "It did not work." : note);
     }
     wake();
     return;
@@ -1147,6 +1212,18 @@ void App::worker() {
       if (d.is_object()) reply["decisions"] = d;
       else reply["fallback"] = true;  // no AI now: the spider's own rules decide
       bridge_.send(job.data.value("client", -1), reply);
+    } else if (job.type == Job::Agent) {
+      {
+        std::lock_guard lock(mu_);
+        if (job.data.value("seq", -1) != task_.seq || task_.state != Task::Thinking) continue;  // you stopped it
+        busy_ = "planning the next step";
+      }
+      wake();
+      const json a = checker_.next_action(jstr(job.data, "goal"), job.data["history"], job.data["snap"]);
+      std::lock_guard lock(mu_);
+      busy_.clear();
+      if (job.data.value("seq", -1) == task_.seq && task_.state == Task::Thinking) agent_step(a, task_.seq);
+      continue;
     } else if (job.type == Job::Pick) {
       {
         std::lock_guard lock(mu_);
@@ -1177,8 +1254,18 @@ void App::worker() {
 void App::commit_goal(const std::string& goal, bool force) {
   // A command ("click Sign in") is not a search: the spider does it instead of hunting.
   if (const json steps = parse_task(goal); !steps.empty()) {
+    // "go to youtube and play a cat video" looks like a click on "youtube and play...": it is a goal.
+    bool hidden_goal = false;
+    for (const json& s : steps)
+      if (jstr(s, "what").find(" and ") != std::string::npos && is_agent_task("x and " + jstr(s, "what"))) hidden_goal = true;
     std::lock_guard lock(mu_);
-    start_task(goal, steps);
+    if (hidden_goal) start_agent(goal);
+    else start_task(goal, steps);
+    return;
+  }
+  if (is_agent_task(goal)) {
+    std::lock_guard lock(mu_);
+    start_agent(goal);
     return;
   }
   int client = -1;
@@ -1275,8 +1362,30 @@ void App::start_task(const std::string& command, const json& steps) {
   wake();
 }
 
-void App::task_next() {
-  task_.log.push_back({task_.desc.empty() ? step_text(task_.steps[task_.at]) : task_.desc, true});
+void App::start_agent(const std::string& goal) {
+  start_task(goal, json::array());
+  task_.agent = true;
+  task_.say = "Looking at the page to plan the first step.";
+}
+
+void App::task_next(bool ok, const std::string& note) {
+  const std::string what = task_.desc.empty() ? step_text(task_.steps[task_.at]) : task_.desc;
+  task_.auto_go = false;
+  if (task_.agent) {
+    // A goal goes on after a failed step too: the AI sees what went wrong and tries something else.
+    task_.log.push_back({what + (ok ? "" : " (" + note + ")"), ok});
+    task_.history.push_back(what + (ok ? ": done" : ": failed, " + note));
+    task_.desc.clear();
+    task_.warn = false;
+    task_.fails = ok ? 0 : task_.fails + 1;
+    if (task_.fails >= 3) return task_stop("Stopped: three steps in a row did not work.");
+    if (++task_.actions >= 25) return task_stop("Stopped after 25 steps. Give it a smaller goal, or the next part of it.");
+    task_.state = Task::Waiting;
+    task_.since = now_seconds() + 1.5;  // a click may have opened a new page: let it load before the next look
+    return;
+  }
+  if (!ok) return task_stop(note);
+  task_.log.push_back({what, true});
   task_.desc.clear();
   task_.warn = false;
   if (++task_.at < task_.steps.size()) {
@@ -1306,7 +1415,28 @@ void App::task_tick() {
   {
     std::lock_guard lock(mu_);
     const double t = now_seconds();
-    if (task_.state == Task::Waiting && t >= task_.since) {
+    if (task_.state == Task::Waiting && t >= task_.since && task_.agent) {
+      // A goal: look at the page you are on, then the AI picks the next step.
+      int client = -1;
+      if (!current(&client)) {
+        task_stop("No browser is connected.");
+      } else {
+        task_.client = client;
+        task_.seq = ++act_seq_;
+        task_.state = Task::Snapping;
+        task_.since = t;
+        out.push_back({client, {{"type", "snap"}, {"seq", task_.seq}}});
+        wake();
+      }
+    } else if (task_.state == Task::Snapping && t - task_.since > 30) {
+      task_stop("The page did not answer. Is the spider allowed on it?");
+    } else if (task_.state == Task::Ready && task_.auto_go && t >= task_.auto_at) {
+      task_.auto_go = false;
+      task_.state = Task::Doing;
+      task_.since = t;
+      out.push_back({task_.client, {{"type", "act-go"}, {"seq", task_.seq}, {"tabId", task_.tab}}});
+      wake();
+    } else if (task_.state == Task::Waiting && t >= task_.since) {
       int client = -1;
       const Browser* b = current(&client);
       const json& step = task_.steps[task_.at];
@@ -1356,22 +1486,45 @@ void App::draw_task() {
   ImGui::BeginChild("##task", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
   ImGui::PushFont(small_, small_->LegacySize);
   ImGui::TextColored(hexv(0x7FD6FF), "%s", task_.command.c_str());
-  if (task_.steps.size() > 1 && task_.state != Task::Done && task_.state != Task::Failed) {
+  if (task_.agent && task_.state != Task::Done && task_.state != Task::Failed) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("   step %d", task_.actions + 1);
+  } else if (task_.steps.size() > 1 && task_.state != Task::Done && task_.state != Task::Failed) {
     ImGui::SameLine();
     ImGui::TextDisabled("   step %zu of %zu", task_.at + 1, task_.steps.size());
   }
-  for (const auto& [text, ok] : task_.log)
+  for (size_t i = task_.log.size() > 6 ? task_.log.size() - 6 : 0; i < task_.log.size(); ++i) {
+    const auto& [text, ok] = task_.log[i];
     ImGui::TextColored(hexv(ok ? 0x8BF5A6 : 0xFF8A6B), "%s %s", ok ? "done:" : "not done:", text.c_str());
+  }
   ImGui::PopFont();
 
   bool closed = false;
+  if (task_.agent && !task_.say.empty() && task_.state != Task::Done && task_.state != Task::Failed) {
+    ImGui::PushFont(small_, small_->LegacySize);
+    ImGui::TextColored(hexv(0xB9C0D8), "%s", task_.say.c_str());
+    ImGui::PopFont();
+  }
   switch (task_.state) {
     case Task::Waiting:
+    case Task::Snapping:
+    case Task::Thinking:
+      if (task_.agent) {
+        ImGui::TextDisabled(task_.state == Task::Thinking ? "Thinking about the next step..." : "Looking at the page...");
+        if (ImGui::SmallButton("Stop")) closed = true;
+        break;
+      }
+      [[fallthrough]];
     case Task::Finding:
       ImGui::TextDisabled("%s: the spider is looking for it...", step_text(task_.steps[task_.at]).c_str());
-      if (ImGui::SmallButton("Cancel")) closed = true;
+      if (ImGui::SmallButton(task_.agent ? "Stop" : "Cancel")) closed = true;
       break;
     case Task::Ready:
+      if (task_.auto_go) {
+        ImGui::TextWrapped("%s...", task_.desc.c_str());
+        if (ImGui::SmallButton("Stop")) closed = true;
+        break;
+      }
       ImGui::TextWrapped("%s?", task_.desc.c_str());
       if (task_.warn)
         ImGui::TextColored(hexv(0xFF8A6B), "Careful: this may spend money, send something, or can't be undone. Look at the page first.");
@@ -1393,6 +1546,7 @@ void App::draw_task() {
       ImGui::TextDisabled("Doing it...");
       break;
     case Task::Done:
+      if (task_.agent && !task_.say.empty()) ImGui::TextWrapped("%s", task_.say.c_str());
       ImGui::TextColored(hexv(0x8BF5A6), "Done.");
       ImGui::SameLine();
       if (ImGui::SmallButton("Close")) closed = true;
@@ -1408,6 +1562,50 @@ void App::draw_task() {
   ImGui::EndChild();
   ImGui::PopStyleColor();
   if (closed) cancel();
+}
+
+// What the AI chose. A click or typing goes to the spider by the thing's
+// number from the last look; the spider holds it, and risky steps wait for you.
+void App::agent_step(const json& a, int seq) {
+  if (!a.is_object()) return task_stop("The local AI is not answering (it is off, or paused because a game is using the graphics card).");
+  const std::string act = jstr(a, "action");
+  task_.say = jstr(a, "say");
+  if (act == "done") {
+    task_.state = Task::Done;
+    task_.since = now_seconds() + 45;  // stays up longer: it may hold an answer
+    return;
+  }
+  if (act == "ask") return task_stop("The spider needs you: " + (task_.say.empty() ? std::string("it is stuck.") : task_.say));
+  json step;
+  const int index = a.value("index", -1);
+  if (act == "click" || act == "type") {
+    step = {{"verb", act}, {"ref", index}, {"what", "#" + std::to_string(index)}};
+    if (act == "type") step["text"] = jstr(a, "text"), step["enter"] = a.value("enter", false);
+  } else if (act == "scroll") {
+    step = {{"verb", "scroll"}, {"dir", jstr(a, "dir") == "up" ? "up" : "down"}};
+  } else if (act == "goto") {
+    const std::string url = as_url(jstr(a, "url"));
+    if (url.empty()) {
+      task_.history.push_back("goto " + jstr(a, "url") + ": failed, not a web address");
+      task_.state = Task::Waiting;
+      task_.since = now_seconds();
+      return;
+    }
+    step = {{"verb", "goto"}, {"url", url}};
+  } else if (act == "back") {
+    step = {{"verb", "back"}};
+  } else {
+    return task_stop("The AI's answer made no sense. Try saying it another way.");
+  }
+  (void)seq;
+  task_.steps = json::array({step});
+  task_.at = 0;
+  task_.desc.clear();
+  task_.seq = ++act_seq_;
+  task_.state = Task::Finding;
+  task_.since = now_seconds();
+  outbox_.push_back({task_.client, {{"type", "act"}, {"seq", task_.seq}, {"tabId", task_.tab}, {"step", step}, {"command", task_.command}}});
+  wake();
 }
 
 void App::send_spider(bool on) {
@@ -1771,7 +1969,7 @@ void App::draw_header() {
     ImGui::SetKeyboardFocusHere();
     focus_goal_ = false;
   }
-  const bool enter = ImGui::InputTextWithHint("##goal", "What are you looking for? Or tell it: click Sign in", goal_,
+  const bool enter = ImGui::InputTextWithHint("##goal", "Look for something, ask a question, or give it a task", goal_,
                                               sizeof(goal_), ImGuiInputTextFlags_EnterReturnsTrue);
   if (ImGui::IsItemEdited()) {
     goal_dirty_ = true;
@@ -2057,6 +2255,14 @@ void App::draw_settings() {
   ImGui::Indent();
   ImGui::TextWrapped("The spider hides them; it never clicks Accept or anything else. Unclear ones go to the local AI. "
                      "Stop the spider and they come back.");
+  ImGui::Unindent();
+  ImGui::PopFont();
+  changed |= ImGui::Checkbox("Tasks: ask me before every step", &s.ask_every_step);
+  ImGui::PushFont(small_, small_->LegacySize);
+  ImGui::Indent();
+  ImGui::TextWrapped("Off: safe steps (scrolling, opening links, searching) just happen, and the spider waits for your Do it "
+                     "only before steps that could spend money, send something, sign you up or can't be undone. "
+                     "It never types passwords or card numbers.");
   ImGui::Unindent();
   ImGui::PopFont();
 
