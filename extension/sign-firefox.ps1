@@ -62,13 +62,13 @@ $api = "https://addons.mozilla.org/api/v5/addons"
 $g = [uri]::EscapeDataString($guid)
 Add-Type -AssemblyName System.Net.Http
 $client = New-Object System.Net.Http.HttpClient
-function PostFile($url, $field, $path, $type, $extra) {
+function PostFile($url, $field, $path, $type, $extra, $method = "POST") {
   $form = New-Object System.Net.Http.MultipartFormDataContent
   $file = New-Object System.Net.Http.ByteArrayContent (, [IO.File]::ReadAllBytes($path))
   $file.Headers.ContentType = [System.Net.Http.Headers.MediaTypeHeaderValue]::Parse($type)
   $form.Add($file, $field, [IO.Path]::GetFileName($path))
   foreach ($k in $extra.Keys) { $form.Add((New-Object System.Net.Http.StringContent $extra[$k]), $k) }
-  $req = New-Object System.Net.Http.HttpRequestMessage ([System.Net.Http.HttpMethod]::Post), $url
+  $req = New-Object System.Net.Http.HttpRequestMessage (New-Object System.Net.Http.HttpMethod $method), $url
   $req.Headers.Authorization = New-Object System.Net.Http.Headers.AuthenticationHeaderValue "JWT", (Jwt)
   $req.Content = $form
   $res = $client.SendAsync($req).Result
@@ -77,7 +77,7 @@ function PostFile($url, $field, $path, $type, $extra) {
   if ([int]$res.StatusCode -eq 429 -and $text -match 'available in (\d+) seconds') {
     Write-Host "Mozilla asks to wait $($Matches[1]) seconds..."
     Start-Sleep ([int]$Matches[1] + 2)
-    return PostFile $url $field $path $type $extra
+    return PostFile $url $field $path $type $extra $method
   }
   if (-not $res.IsSuccessStatusCode) { throw "Upload to $url failed ($([int]$res.StatusCode)): $text" }
   $text | ConvertFrom-Json
@@ -115,7 +115,7 @@ Every find gets a check from a real source, shown as a badge next to it: verifie
 
 Type what you are looking for in the SpiderPet app and the spider hunts for it on the page you have open: every match lights up, and the spider goes from match to match.
 
-<b>Needs the SpiderPet app (Windows, free and open source).</b> The add-on is the spider; the app is its brain. It does the checks with a local AI model (Ollama) on your own PC and keeps a library of everything the spider found. Download it from $repo/releases/latest and run it once.
+NEEDS THE SPIDERPET APP (Windows, free and open source). The add-on is the spider; the app is its brain. It does the checks with a local AI model (Ollama) on your own PC and keeps a library of everything the spider found. Download it from $repo/releases/latest and run it once.
 
 Privacy: the page never leaves your PC. With Online checks on (a switch in the app), only each single find (an id, a title or a few search words) is looked up in Crossref, OpenLibrary, Google Books, PubMed, arXiv or Wikipedia.
 
@@ -150,6 +150,13 @@ $addon = Call Get "$api/addon/$g/"
 if (-not $Private) {
   try { Call Patch "$api/addon/$g/eula_policy/" @{ privacy_policy = @{ "en-US" = $privacy } } | Out-Null }
   catch { Write-Host "Could not set the privacy policy ($($_.Exception.Message)). Add it on the add-on's edit page." }
+  # The store does not take the icon from the manifest: without this it shows a green puzzle piece.
+  if (-not $addon.icon_url -or $addon.icon_url -match "default") {
+    try {
+      PostFile "$api/addon/$g/" "icon" (Join-Path $here "src\icons\128.png") "image/png" @{} "PATCH" | Out-Null
+      Write-Host "Added the spider icon."
+    } catch { Write-Host "Could not add the icon ($($_.Exception.Message))." }
+  }
   # The screenshots the store page does not have yet, in this order.
   $shots = @("page.png", "app.png")
   $there = @($addon.previews).Where({ $_ }).Count
