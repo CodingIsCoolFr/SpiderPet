@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SpiderPet</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <header>
+    <div class="brand"><img src="icons/32.png" alt="" width="22" height="22"><span>SpiderPet</span></div>
+    <div class="status" id="status"></div>
+  </header>
+
+  <div class="row">
+    <button id="toggle" class="primary">Drop the spider here</button>
+    <button id="openApp" title="Open the SpiderPet app: the whole library">Library</button>
+  </div>
+  <input id="goal" type="text" placeholder="What are you looking for? The spider goes after that first.">
+
+  <section id="gist" class="card" hidden></section>
+
+  <div class="filters" id="filters">
+    <button data-f="all" class="on">All</button>
+    <button data-f="problems">Problems</button>
+    <button data-f="verified">Verified</button>
+    <button data-f="ids">Sources</button>
+    <button data-f="sentence">Facts</button>
+  </div>
+  <div class="counts" id="counts"></div>
+  <main id="list"></main>
+  <p class="empty" id="empty">Press the spider button in the toolbar (or Alt+Shift+S) on any page. Everything it finds shows up here with a check.</p>
+
+  <script src="panel.js"></script>
+</body>
+</html>

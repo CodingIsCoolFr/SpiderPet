@@ -1,847 +1,1162 @@
-// SpiderPet: a node-and-line spider that walks on whatever window you drop it
-// on, reads it with Windows OCR, and harvests what is worth keeping.
-#include "app/store.hpp"
+// SpiderPet.exe: the brain and the library behind the browser spider.
+//
+// The extension walks the page and harvests DOIs, ISBNs, ids, titles, links
+// and key sentences from the real page text. Everything it finds comes here
+// (through SpiderHost.exe), is checked against real sources with the local
+// model as the judge, ranked against what you are looking for, and kept in
+// one library across browsers. The window shows it; the tray keeps it running.
+//
+//   SpiderPet.exe          open the window
+//   SpiderPet.exe --tray   start in the tray (what SpiderHost does)
+#include "app/bridge.hpp"
+#include "app/library.hpp"
 #include "core/util.hpp"
-#include "mind/llm.hpp"
-#include "page/page.hpp"
-#include "pet/pet.hpp"
-#include "render/overlay.hpp"
-#include "render/paint.hpp"
-#include "render/scene.hpp"
-#include "see/inspector.hpp"
-#include "see/vision.hpp"
-#include "ui/panel.hpp"
+#include "mind/check.hpp"
 
-#include <windows.h>
+#include "imgui.h"
+#include "imgui_impl_dx11.h"
+#include "imgui_impl_win32.h"
+
+#include <d3d11.h>
 #include <dwmapi.h>
+#include <dxgi1_3.h>
 #include <shellapi.h>
-#include <shellscalingapi.h>
+#include <shlobj.h>
+#include <wrl/client.h>
 
 #include <algorithm>
-#include <cstring>
-#include <string>
-#include <vector>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <mutex>
+#include <set>
+#include <thread>
 
-using namespace sp;
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
+using Microsoft::WRL::ComPtr;
+using json = nlohmann::json;
+
+namespace sp {
 namespace {
 
-std::wstring class_of(HWND h) {
-  wchar_t b[128]{};
-  GetClassNameW(h, b, 128);
-  return b;
+constexpr UINT kTrayMsg = WM_APP + 1;
+constexpr UINT kShowMsg = WM_APP + 2;
+constexpr UINT kWakeMsg = WM_APP + 3;
+constexpr const char* kVersion = "3.0.0";
+
+ImVec4 hexv(uint32_t c, float a = 1.f) {
+  return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
 }
 
-std::wstring title_of(HWND h) {
-  wchar_t b[512]{};
-  GetWindowTextW(h, b, 512);
-  return b;
+// The colors the spider restyles each kind with on the page.
+uint32_t kind_color(const std::string& k) {
+  static const std::map<std::string, uint32_t> m = {{"sentence", 0xE64CF2}, {"heading", 0xE64CF2}, {"title", 0xF2836B},
+                                                    {"doi", 0x93F5AE},      {"isbn", 0x7D8BFF},    {"id", 0x4E8FF0},
+                                                    {"link", 0x7FD6FF},     {"number", 0xFF5C5C},  {"date", 0xFFC46B}};
+  auto it = m.find(k);
+  return it == m.end() ? 0xC8CCD8 : it->second;
 }
 
-// "(3) Home / X" and "Home / X" are the same page.
-std::wstring page_key(std::wstring t) {
-  if (!t.empty() && t[0] == L'(') {
-    const size_t c = t.find(L") ");
-    if (c != std::wstring::npos && c < 8) t = t.substr(c + 2);
-  }
-  return t;
+struct Pill {
+  const char* text;
+  uint32_t bg;
+  uint32_t fg;
+};
+
+Pill pill_for(const json& v) {
+  const std::string st = v.is_object() ? v.value("status", "") : "";
+  if (st == "verified") return {"VERIFIED", 0x2E7D4F, 0xE9FFF0};
+  if (st == "mismatch") return {"WRONG", 0xB4561E, 0xFFF3E8};
+  if (st == "not_found") return {"NOT FOUND", 0xA8323A, 0xFFECEC};
+  if (st == "unverified") return {"UNCLEAR", 0x3A3E52, 0xD6D9E6};
+  if (st == "opinion") return {"OPINION", 0x6A3C8C, 0xF4E9FF};
+  if (st == "promo") return {"AD", 0x6A3C8C, 0xF4E9FF};
+  if (st == "queued" || st == "checking") return {"CHECKING", 0x24426E, 0xDCEBFF};
+  if (st == "error") return {"NOT CHECKED", 0x4A2A2E, 0xF0C8CC};
+  if (st == "skipped") return {"", 0, 0};
+  return {"", 0, 0};
 }
 
-bool cloaked(HWND h) {
-  BOOL c = FALSE;
-  DwmGetWindowAttribute(h, DWMWA_CLOAKED, &c, sizeof(c));
-  return c != FALSE;
+bool problem(const json& v) {
+  const std::string st = v.is_object() ? v.value("status", "") : "";
+  return st == "mismatch" || st == "not_found";
 }
 
-bool is_shell(HWND h) {
-  const std::wstring c = class_of(h);
-  return c == L"Progman" || c == L"WorkerW" || c == L"Shell_TrayWnd" || c == L"Shell_SecondaryTrayWnd";
+std::string jstr(const json& j, const char* k) {
+  auto it = j.find(k);
+  return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
 }
 
-// Windows that are safe to scroll with a wheel message. SpiderTestPage is the
-// test viewer in SpiderTool.
-bool is_browser(HWND h) {
-  const std::wstring c = class_of(h);
-  return c == L"Chrome_WidgetWin_1" || c == L"MozillaWindowClass" || c == L"SpiderTestPage";
+// What relevance means something for: words a person reads. Ids ride on their titles.
+bool rankable(const json& f) {
+  const std::string k = jstr(f, "kind");
+  return k == "sentence" || k == "heading" || k == "link" || k == "title";
 }
 
-RECT monitor_rect(POINT p, bool work) {
-  MONITORINFO mi{sizeof(mi)};
-  GetMonitorInfoW(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST), &mi);
-  return work ? mi.rcWork : mi.rcMonitor;
+std::wstring exe_dir() {
+  wchar_t path[MAX_PATH];
+  GetModuleFileNameW(nullptr, path, MAX_PATH);
+  std::wstring p = path;
+  return p.substr(0, p.find_last_of(L"\\/"));
 }
 
-float dpi_scale(POINT p) {
-  UINT x = 96, y = 96;
-  GetDpiForMonitor(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST), MDT_EFFECTIVE_DPI, &x, &y);
-  return x / 96.f;
+void open_url(const std::string& url) {
+  if (url.rfind("http", 0) == 0) ShellExecuteW(nullptr, L"open", wide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-Rect to_rect(const RECT& r) {
-  return {static_cast<float>(r.left), static_cast<float>(r.top), static_cast<float>(r.right - r.left),
-          static_cast<float>(r.bottom - r.top)};
-}
+void open_path(const std::wstring& path) { ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
 
-double idle_seconds() {
-  LASTINPUTINFO li{sizeof(li)};
-  if (!GetLastInputInfo(&li)) return 0;
-  return (GetTickCount() - li.dwTime) / 1000.0;
-}
-
-void copy_text(HWND owner, const std::string& text) {
+void copy_text(HWND hwnd, const std::string& text) {
   const std::wstring w = wide(text);
-  if (!OpenClipboard(owner)) return;
+  if (!OpenClipboard(hwnd)) return;
   EmptyClipboard();
-  if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (w.size() + 1) * sizeof(wchar_t))) {
-    std::memcpy(GlobalLock(mem), w.c_str(), (w.size() + 1) * sizeof(wchar_t));
+  HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (w.size() + 1) * sizeof(wchar_t));
+  if (mem) {
+    memcpy(GlobalLock(mem), w.c_str(), (w.size() + 1) * sizeof(wchar_t));
     GlobalUnlock(mem);
     SetClipboardData(CF_UNICODETEXT, mem);
   }
   CloseClipboard();
 }
 
-struct Options {
-  std::wstring attach_title;  // start on the first window whose title contains this
-  double seconds = 0;         // quit after this long (tests)
-  bool quiet = false;         // start with the panel minimized, never take focus
-  bool second = false;        // tests: run beside a copy that is already open
-  bool panel_at = false;      // put the panel here instead of the default spot
-  POINT panel_pos{};
-};
+}  // namespace
 
 class App {
  public:
-  int run(HINSTANCE inst, const Options& opt);
+  int run(HINSTANCE inst, bool tray);
 
  private:
-  Vec2 offset() const;  // content = screen + offset
-  Vec2 to_content(POINT p) const { return Vec2{static_cast<float>(p.x), static_cast<float>(p.y)} + offset(); }
-  Vec2 to_screen(Vec2 c) const { return c - offset(); }
-  HWND window_at(POINT p) const;
-  void attach(HWND w, POINT at, double now);
-  void detach();
-  void new_page(double now);
-  void follow_target(double now);
-  void refresh_above(double now);
-  bool covered(Vec2 screen) const;
-  View view() const;
-  void frame(double now, float dt);
-  void handle(const PanelActions& a, double now);
+  // window, tray, drawing
+  bool create_window(HINSTANCE inst, bool show);
+  void make_target();
+  void destroy_window();
+  static LRESULT CALLBACK proc(HWND, UINT, WPARAM, LPARAM);
+  LRESULT handle(UINT msg, WPARAM wp, LPARAM lp);
+  void tray_add();
+  void tray_remove();
+  void show();
+  void hide();
+  void style();
+  void draw();
+  void draw_header();
+  void draw_page();
+  void draw_library();
+  void draw_settings();
+  void draw_setup();
+  void draw_find(const json& f, bool show_page);
+  void wake() { if (hwnd_) PostMessageW(hwnd_, kWakeMsg, 0, 0); }
 
-  Overlay overlay_;
-  Panel panel_;
-  Vision vision_;
-  Inspector inspector_;
-  Llm llm_;
-  Store store_;
-  Page page_;
-  Pet pet_;
-  Scene scene_;
-  Painter painter_;
+  // the brain
+  void on_message(int client, const json& m);
+  void on_gone(int client);
+  void queue_check(const std::string& id, bool urgent);
+  void queue_rank(const std::string& url, const std::vector<std::string>& ids);
+  void rerank(const std::string& url);
+  void worker();
+  json state_msg();
+  void apply_settings(const json& partial);
+  void reveal(const std::string& url, const std::string& id);
+
+  struct Job {
+    enum Type { Check, Rank, Gist } type;
+    std::string url, id;
+    json data;
+  };
+
+  HWND hwnd_ = nullptr;
+  HINSTANCE inst_ = nullptr;
+  ComPtr<ID3D11Device> device_;
+  ComPtr<ID3D11DeviceContext> ctx_;
+  ComPtr<IDXGISwapChain1> swap_;
+  ComPtr<ID3D11RenderTargetView> rtv_;
+  ImGuiContext* imgui_ = nullptr;
+  ImFont* body_ = nullptr;
+  ImFont* title_ = nullptr;
+  ImFont* small_ = nullptr;
+  ImFont* bold_ = nullptr;
+  float scale_ = 1.f;
+  bool visible_ = false;
+  bool quitting_ = false;
+  NOTIFYICONDATAW tray_{};
+
+  std::mutex mu_;
+  Library lib_;
   Settings settings_;
-  HWND panel_hwnd_ = nullptr;
+  Checker checker_;
+  Bridge bridge_;
+  std::map<int, std::string> browsers_;  // client -> "Firefox", "Brave"...
+  std::string active_url_;               // the page the spider is on now
+  json status_ = {{"ollama", false}, {"model", ""}};
+  std::string busy_;                     // what the worker is doing
+  std::deque<Job> urgent_, jobs_;
+  std::set<std::string> queued_;         // check ids waiting, so nothing is queued twice
+  std::condition_variable cv_;
+  std::thread worker_;
+  std::atomic<bool> quit_{false};
+  bool registered_ = false;
+  std::wstring register_error_;
 
-  HWND root_ = nullptr;
-  RECT root_rect_{};
-  RECT content_{};
-  bool content_known_ = false;
-  bool scrollable_ = false;
-  std::wstring title_, key_, url_;
-  uint64_t gen_ = 0, page_id_ = 0, token_ = 0;
-  double inspect_at_ = 0, title_at_ = 0, scroll_req_at_ = 0, above_at_ = 0, retry_at_ = 0;
-  // Did the last scroll request move anything? Pages that scroll an inner box
-  // need the wheel; pages that cannot scroll (or are at the end) stop crawling.
-  double scroll_check_at_ = 0, scroll_before_ = 0;
-  int scroll_fails_ = 0, scroll_method_ = 0;
-  // Browser mode: the page's own text, links and headings via accessibility.
-  bool page_tree_ = false;
-  double scan_at_ = 0, scan_scroll_ = 0;
-  uint64_t scan_token_ = 0;
-  bool scroll_dead_ = false;
-  double user_scrolled_at_ = -100, motion_seen_ = 0;
-  // "Show me where it is": scroll the page to a find, then point at it.
-  int seek_ = 0;
-  double seek_until_ = 0, seek_step_at_ = 0;
-  void seek(const Record& r, double now);
-  int inspect_tries_ = 0;
-  double scroll_ = 0;
-  RECT free_{};
-  std::vector<RECT> above_;
-  RECT box_{};  // overlay box while the spider is loose
-  bool bubble_drag_ = false;
-  Vec2 bubble_grab_{};
-  Vec2 local(POINT p) const {
-    const RECT b = overlay_.bounds();
-    return {static_cast<float>(p.x - b.left), static_cast<float>(p.y - b.top)};
-  }
-  float dim_ = 0;
+  // UI state
+  char goal_[512] = {};
+  char search_[256] = {};
+  int status_filter_ = 0;
+  std::string notice_;
+  double notice_at_ = 0;
+  json pending_;  // settings changed in the window this frame
 };
 
-Vec2 App::offset() const {
-  if (!root_) return {};
-  return {static_cast<float>(-content_.left), static_cast<float>(-content_.top + scroll_)};
-}
+int App::run(HINSTANCE inst, bool tray) {
+  inst_ = inst;
+  settings_.load();
+  lib_.load();
+  // Checks that were waiting when the app last closed start over.
+  for (auto& [id, f] : lib_.finds().items()) {
+    const json& v = f["verdict"];
+    if (v.is_object() && (jstr(v, "status") == "queued" || jstr(v, "status") == "checking")) lib_.set_verdict(id, nullptr);
+  }
+  checker_.set_model(settings_.model);
+  if (!lib_.page_order().empty()) active_url_ = lib_.page_order().front();  // the last page you were on
+  snprintf(goal_, sizeof(goal_), "%s", settings_.goal.c_str());
 
-// Topmost real window under a point, skipping our own windows and the desktop.
-HWND App::window_at(POINT p) const {
-  for (HWND h = GetTopWindow(nullptr); h; h = GetWindow(h, GW_HWNDNEXT)) {
-    if (h == overlay_.hwnd() || h == panel_hwnd_) continue;
-    if (!IsWindowVisible(h) || IsIconic(h) || cloaked(h)) continue;
-    const LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
-    if ((ex & WS_EX_TRANSPARENT) || ((ex & WS_EX_LAYERED) && (ex & WS_EX_TOOLWINDOW))) continue;
-    RECT r;
-    if (!GetWindowRect(h, &r) || !PtInRect(&r, p)) continue;
-    if (is_shell(h)) return nullptr;
-    return GetAncestor(h, GA_ROOT);
-  }
-  return nullptr;
-}
+  const std::wstring host = exe_dir() + L"\\SpiderHost.exe";
+  if (_wgetenv(L"SPIDERPET_DATA")) registered_ = true;  // a test copy: leave the real registration alone
+  else if (GetFileAttributesW(host.c_str()) != INVALID_FILE_ATTRIBUTES) registered_ = register_native_host(host, &register_error_);
+  else register_error_ = L"SpiderHost.exe is missing next to SpiderPet.exe";
 
-void App::attach(HWND w, POINT at, double now) {
-  if (!w || w == overlay_.hwnd() || w == panel_hwnd_) return;
-  const Vec2 before = offset();
-  root_ = w;
-  GetWindowRect(w, &root_rect_);
-  RECT cr;
-  GetClientRect(w, &cr);
-  MapWindowPoints(w, nullptr, reinterpret_cast<POINT*>(&cr), 2);
-  content_ = cr;  // until UI Automation finds the page area
-  content_known_ = false;
-  scroll_ = 0;
-  title_ = title_of(w);
-  key_ = page_key(title_);
-  url_.clear();
-  gen_ = vision_.watch(nullptr, RECT{});
-  page_.clear();
-  scene_.forget();
-  pet_.forget_page();
-  page_.set_title(title_);
-  ++page_id_;
-  inspector_.inspect(w, at, ++token_);
-  inspect_at_ = now;
-  inspect_tries_ = 1;
-  retry_at_ = 0;
-  scroll_fails_ = scroll_method_ = 0;
-  scroll_dead_ = false;
-  scroll_check_at_ = 0;
-  page_tree_ = false;
-  scrollable_ = false;
-  debug_log("attach '" + utf8(title_) + "' class=" + utf8(class_of(w)));
-  pet_.shift(offset() - before);
-}
+  status_ = checker_.status();  // so the first hello already knows about the model
+  if (!create_window(inst, !tray)) return 1;
+  tray_add();
+  bridge_.start([this](int c, const json& m) { on_message(c, m); }, [this](int c) { on_gone(c); });
+  worker_ = std::thread([this] { worker(); });
 
-void App::detach() {
-  if (!root_) return;
-  const Vec2 before = offset();
-  const Vec2 spot = to_screen(pet_.spider().pos());
-  root_ = nullptr;
-  content_known_ = false;
-  vision_.watch(nullptr, RECT{});
-  page_.clear();
-  scene_.forget();
-  pet_.forget_page();
-  free_ = monitor_rect({static_cast<LONG>(spot.x), static_cast<LONG>(spot.y)}, true);
-  pet_.shift(offset() - before);
-}
-
-// Same window, different page: start over but keep the spider where it is.
-void App::new_page(double now) {
-  const Vec2 before = offset();
-  title_ = title_of(root_);
-  key_ = page_key(title_);
-  page_.clear();
-  scene_.forget();
-  pet_.forget_page();
-  page_.set_title(title_);
-  ++page_id_;
-  scroll_ = 0;
-  if (content_known_) gen_ = vision_.watch(root_, content_);
-  pet_.shift(offset() - before);
-  POINT c{(content_.left + content_.right) / 2, (content_.top + content_.bottom) / 2};
-  inspector_.inspect(root_, c, ++token_);
-  inspect_at_ = now;
-  inspect_tries_ = 1;
-  retry_at_ = 0;
-  scroll_fails_ = scroll_method_ = 0;
-  scroll_dead_ = false;
-  scroll_check_at_ = 0;
-}
-
-void App::follow_target(double now) {
-  if (!root_) return;
-  if (!IsWindow(root_) || IsIconic(root_) || !IsWindowVisible(root_) || cloaked(root_)) {
-    detach();
-    return;
-  }
-  RECT r;
-  GetWindowRect(root_, &r);
-  const bool resized = (r.right - r.left) != (root_rect_.right - root_rect_.left) ||
-                       (r.bottom - r.top) != (root_rect_.bottom - root_rect_.top);
-  if (resized) {
-    root_rect_ = r;
-    POINT c{(r.left + r.right) / 2, (r.top + r.bottom) / 2};
-    attach(root_, c, now);  // text reflowed: read it fresh
-    return;
-  }
-  if (r.left != root_rect_.left || r.top != root_rect_.top) {
-    const Vec2 before = offset();
-    OffsetRect(&content_, r.left - root_rect_.left, r.top - root_rect_.top);
-    root_rect_ = r;
-    if (content_known_) vision_.move(content_);
-    pet_.shift(offset() - before);  // the spider rides along with the window
-  }
-  // Look at the page area again now and then: pages finish loading late.
-  if (content_known_ && is_browser(root_) && retry_at_ == 0 && now - inspect_at_ > 4.0) {
-    inspect_at_ = now;
-    inspector_.inspect(root_, {(content_.left + content_.right) / 2, (content_.top + content_.bottom) / 2}, ++token_);
-  }
-  if (now - title_at_ > 0.4) {
-    title_at_ = now;
-    if (page_key(title_of(root_)) != key_) new_page(now);
-  }
-
-  // Chromium builds its accessibility tree only after the first request, so
-  // a miss is asked again a couple of times before settling for the client area.
-  if (retry_at_ > 0 && now >= retry_at_) {
-    retry_at_ = 0;
-    ++inspect_tries_;
-    inspector_.inspect(root_, {(content_.left + content_.right) / 2, (content_.top + content_.bottom) / 2}, ++token_);
-  }
-  Inspector::Result res;
-  while (inspector_.take(res)) {
-    if (res.token != token_) continue;
-    if (!res.url.empty()) url_ = res.url;
-    if (!res.found && inspect_tries_ < 3) retry_at_ = now + 0.8;
-    RECT doc = content_;
-    if (res.found) IntersectRect(&doc, &res.doc, &root_rect_);
-    debug_log("inspect try=" + std::to_string(inspect_tries_) + " found=" + std::to_string(res.found) + " doc=" +
-              std::to_string(doc.left) + "," + std::to_string(doc.top) + "," + std::to_string(doc.right) + "," +
-              std::to_string(doc.bottom) + " scroll=" + std::to_string(res.can_scroll) + " url=" + utf8(url_));
-    if (content_known_ && EqualRect(&doc, &content_)) continue;
-    // Later looks only replace the page area when they found a clearly better
-    // one (the page finished loading, the first pick was an inner box).
-    if (content_known_) {
-      const auto area = [](const RECT& r) { return static_cast<double>(r.right - r.left) * (r.bottom - r.top); };
-      RECT client;
-      GetClientRect(root_, &client);
-      const bool tiny = area(content_) < 0.25 * area(client);
-      if (!res.found || (!tiny && area(doc) < area(content_) * 1.25)) continue;
-    }
-    const Vec2 before = offset();
-    if (content_known_) {  // a better page area turned up late: start this page over
-      page_.clear();
-      scene_.forget();
-      pet_.forget_page();
-    }
-    content_ = doc;
-    page_tree_ = res.found;
-    scrollable_ = res.can_scroll || is_browser(root_);
-    content_known_ = true;
-    scroll_ = 0;
-    gen_ = vision_.watch(root_, content_);
-    pet_.shift(offset() - before);
-  }
-  if (!content_known_ && now - inspect_at_ > 2.5) {
-    const Vec2 before = offset();
-    content_known_ = true;
-    scrollable_ = is_browser(root_);
-    scroll_ = 0;
-    gen_ = vision_.watch(root_, content_);
-    pet_.shift(offset() - before);
-  }
-}
-
-// Windows stacked over the target (the panel counts; our overlay does not).
-void App::refresh_above(double now) {
-  if (now - above_at_ < 0.25) return;
-  above_at_ = now;
-  above_.clear();
-  if (!root_) return;
-  for (HWND h = GetWindow(root_, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV)) {
-    if (h == overlay_.hwnd() || !IsWindowVisible(h) || IsIconic(h) || cloaked(h)) continue;
-    const LONG ex = GetWindowLongW(h, GWL_EXSTYLE);
-    if (ex & WS_EX_TRANSPARENT) continue;
-    RECT r;
-    if (!GetWindowRect(h, &r) || r.right - r.left < 8 || r.bottom - r.top < 8) continue;
-    if (ex & WS_EX_LAYERED) {  // full-screen overlays from other apps are see-through
-      const RECT m = monitor_rect({(r.left + r.right) / 2, (r.top + r.bottom) / 2}, false);
-      if ((r.right - r.left) * 10 >= (m.right - m.left) * 9 && (r.bottom - r.top) * 10 >= (m.bottom - m.top) * 9)
-        continue;
-    }
-    above_.push_back(r);
-  }
-}
-
-bool App::covered(Vec2 s) const {
-  const POINT p{static_cast<LONG>(s.x), static_cast<LONG>(s.y)};
-  for (const RECT& r : above_)
-    if (PtInRect(&r, p)) return true;
-  return false;
-}
-
-View App::view() const {
-  View v;
-  if (root_) {
-    v.visible = {0, static_cast<float>(scroll_), static_cast<float>(content_.right - content_.left),
-                 static_cast<float>(content_.bottom - content_.top)};
-    v.attached = content_known_;
-    const Vec2 mid{(content_.left + content_.right) * 0.5f, (content_.top + content_.bottom) * 0.5f};
-    // It keeps going on its own; it backs off for a few seconds after you
-    // scroll yourself, and while you hold the mouse button (selecting text).
-    const bool holding = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
-    v.crawl_ok = settings_.crawl && content_known_ && scrollable_ && !scroll_dead_ && !holding &&
-                 now_seconds() - user_scrolled_at_ > 4.0 && !covered(mid);
-    v.page_end = scroll_dead_;
-  } else {
-    v.visible = to_rect(free_);
-  }
-  return v;
-}
-
-void App::frame(double now, float dt) {
-  follow_target(now);
-  refresh_above(now);
-
-  if (root_ && content_known_) {
-    const Vision::State st = vision_.state();
-    if (st.generation == gen_) {
-      scroll_ = st.scroll;
-      // Motion we did not ask for is the user scrolling: back off, and the
-      // page may have more below again.
-      if (st.last_motion > motion_seen_) {
-        motion_seen_ = st.last_motion;
-        if (st.last_motion - scroll_req_at_ > 1.2) {
-          user_scrolled_at_ = st.last_motion;
-          scroll_dead_ = false;
-          scroll_fails_ = 0;
-        }
-      }
-    }
-    OcrPass pass;
-    while (vision_.take(pass)) {
-      if (pass.generation != gen_) continue;
-      // Window capture sees the page even under other windows; a screen copy
-      // does not, so then covered lines are left out.
-      const bool own_pixels = vision_.state().window_capture;
-      const float drift = page_.merge(pass, [this, own_pixels](const Rect& box) {
-        return own_pixels || !covered(to_screen(box.center()));
-      });
-      if (drift != 0) pet_.shift({0, drift});
-      // Fresh text geometry: ask the page what it says about the same view.
-      if (page_tree_ && now - scan_at_ > 2.5) {
-        scan_at_ = now;
-        scan_scroll_ = scroll_;
-        inspector_.scan(root_, ++scan_token_);
-      }
-      debug_log("ocr lines=" + std::to_string(pass.lines.size()) + " took=" + std::to_string(int(pass.took * 1000)) +
-                "ms scroll=" + std::to_string(int(pass.scroll)) + " drift=" + std::to_string(drift) +
-                " entities=" + std::to_string(page_.entities().size()) + " pitch=" + std::to_string(page_.pitch()));
-    }
-  }
-
-  // The page's own words. Dropped if the page scrolled while it was read.
-  Inspector::Scan tree;
-  while (inspector_.take_scan(tree)) {
-    if (!root_ || tree.token != scan_token_ || std::fabs(scroll_ - scan_scroll_) > 2.0) continue;
-    std::vector<Fact> facts;
-    for (const Inspector::Node& n : tree.nodes) {
-      Fact f;
-      f.type = static_cast<Fact::Type>(n.type);
-      f.text = n.text;
-      f.url = n.url;
-      f.level = n.level;
-      f.box = {static_cast<float>(n.rect.left - content_.left),
-               static_cast<float>(n.rect.top - content_.top + scroll_), static_cast<float>(n.rect.right - n.rect.left),
-               static_cast<float>(n.rect.bottom - n.rect.top)};
-      facts.push_back(std::move(f));
-    }
-    const float y0 = static_cast<float>(scroll_), y1 = y0 + static_cast<float>(content_.bottom - content_.top);
-    page_.merge_facts(std::move(facts), y0, y1);
-    debug_log("page tree: " + std::to_string(tree.nodes.size()) + " nodes in " + std::to_string(int(tree.took * 1000)) +
-              " ms, entities=" + std::to_string(page_.entities().size()));
-  }
-
-  const Vec2 spider_screen = to_screen(pet_.spider().pos());
-  const POINT sp_pt{static_cast<LONG>(spider_screen.x), static_cast<LONG>(spider_screen.y)};
-  float base = dpi_scale(sp_pt);
-  if (root_ && !page_.empty()) base = std::clamp(page_.pitch() / 22.f, 0.7f, 1.7f);
-  pet_.set_scale(base * settings_.size);
-
-  View v = view();
-  if (seek_) {
-    v.crawl_ok = false;  // the page is ours to steer for a moment
-    const Entity* e = page_.find(seek_);
-    const float h = static_cast<float>(content_.bottom - content_.top);
-    if (!root_ || !e || now > seek_until_) {
-      seek_ = 0;
-    } else {
-      const float want = e->box.center().y - h * 0.4f;  // put it a bit above the middle
-      const float delta = want - static_cast<float>(scroll_);
-      if (std::fabs(delta) < h * 0.25f) {
-        Entity* live = page_.find(seek_);
-        live->applied_at = now;  // replay its glitch so it pops
-        pet_.point(*live, now);
-        user_scrolled_at_ = now + 4.0;  // and let you look before crawling on
-        seek_ = 0;
-      } else if (now - seek_step_at_ > 0.3 && now - vision_.state().last_motion > 0.12) {
-        seek_step_at_ = now;
-        const int notches = std::clamp(static_cast<int>(delta / 100.f), -6, 6);
-        scroll_req_at_ = now;
-        inspector_.scroll(root_, {(content_.left + content_.right) / 2, (content_.top + content_.bottom) / 2},
-                          notches == 0 ? (delta > 0 ? 1 : -1) : notches, scroll_method_);
-      }
-    }
-  }
-  pet_.update(now, dt, page_, v, settings_);
-
-  if (scroll_check_at_ > 0 && now >= scroll_check_at_) {
-    scroll_check_at_ = 0;
-    if (std::fabs(scroll_ - scroll_before_) < 4) {
-      ++scroll_fails_;
-      if (scroll_fails_ == 2) scroll_method_ = 1;  // try the wheel instead
-      if (scroll_fails_ >= 4) scroll_dead_ = true;
-      debug_log("scroll did not move, fails=" + std::to_string(scroll_fails_));
-    } else {
-      scroll_fails_ = 0;
-    }
-  }
-  if (v.crawl_ok && pet_.wants_scroll() > 20.f * pet_.spider().scale() && now - scroll_req_at_ > 0.45 &&
-      now - vision_.state().last_motion > 0.15 && scroll_check_at_ == 0) {
-    scroll_req_at_ = now;
-    scroll_before_ = scroll_;
-    scroll_check_at_ = now + 0.8;
-    debug_log("scroll request, spider wants " + std::to_string(int(pet_.wants_scroll())));
-    inspector_.scroll(root_, {(content_.left + content_.right) / 2, (content_.top + content_.bottom) / 2}, 1, scroll_method_);
-  }
-
-  for (const Ask& a : pet_.take_asks())
-    if (settings_.brain) llm_.ask(a, page_id_, title_);
-  for (const Llm::Answer& ans : llm_.take()) {
-    if (ans.page != page_id_) continue;
-    pet_.answer(ans.ask, ans.text, page_, now);
-    debug_log("llm " + ans.ask.task + ": " + ans.text);
-    if (ans.ask.entity > 0) store_.summarize(page_id_, ans.ask.entity, ans.text);
-  }
-  for (const Harvest& h : pet_.take_harvest()) {
-    store_.add(h, page_id_, url_.empty() ? title_ : url_);
-    debug_log(std::string("harvest ") + kind_name(h.kind) + ": " + utf8(h.text));
-  }
-
-  // Hover and grab.
-  POINT cur;
-  GetCursorPos(&cur);
-  const bool over = pet_.hit(to_content(cur));
-  const bool over_bubble = scene_.bubble_hit(local(cur));
-  overlay_.grab_cursor = over || over_bubble;
-  overlay_.set_interactive(over || over_bubble || pet_.dragging() || bubble_drag_);
-
-  // Keep the see-through window as small as the moment allows: the page plus
-  // a margin for legs when attached, a box around the spider when loose. A
-  // full-screen overlay would make Windows compose every game under it.
-  const float reach = pet_.spider().reach();
-  const Pet::State st = pet_.state();
-  const bool airborne = st == Pet::State::Descend || st == Pet::State::Ascend || st == Pet::State::Thrown;
-  RECT want{};
-  if (root_ && !pet_.dragging()) {
-    const RECT mon = monitor_rect({(content_.left + content_.right) / 2, (content_.top + content_.bottom) / 2}, false);
-    RECT grown = content_;
-    InflateRect(&grown, static_cast<int>(reach * 1.4f + 40), static_cast<int>(reach * 1.4f + 40));
-    IntersectRect(&want, &grown, &mon);
-    box_ = {};
-  } else if (airborne && !pet_.dragging()) {
-    want = monitor_rect(sp_pt, false);
-    box_ = {};
-  } else {
-    // Loose or held: a fixed-size box that only moves when the spider nears its edge.
-    const int half = static_cast<int>(reach * 2.4f + 140);  // room for the thought bubble
-    const POINT c = pet_.dragging() ? cur : sp_pt;
-    RECT inner = box_;
-    InflateRect(&inner, -half / 2, -half / 2);
-    if (box_.right - box_.left != 2 * half || !PtInRect(&inner, c)) box_ = {c.x - half, c.y - half, c.x + half, c.y + half};
-    want = box_;
-  }
-  overlay_.cover(want);
-
-  // Step aside entirely for full-screen apps and games, and when the page is
-  // buried under other windows: no window of ours left for Windows to compose.
-  bool step_aside = false;
-  if (!pet_.dragging()) {
-    HWND fg = GetForegroundWindow();
-    if (fg && fg != root_ && fg != panel_hwnd_ && fg != overlay_.hwnd() && !is_shell(fg)) {
-      RECT fr;
-      const RECT fm = monitor_rect(sp_pt, false);
-      if (GetWindowRect(fg, &fr) && fr.left <= fm.left && fr.top <= fm.top && fr.right >= fm.right &&
-          fr.bottom >= fm.bottom && MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) == MonitorFromPoint(sp_pt, MONITOR_DEFAULTTONEAREST))
-        step_aside = true;
-    }
-    if (root_) {
-      int hidden_pts = 0;
-      for (int gy = 0; gy < 6; ++gy)
-        for (int gx = 0; gx < 6; ++gx) {
-          const Vec2 q{content_.left + (content_.right - content_.left) * (gx + 0.5f) / 6.f,
-                       content_.top + (content_.bottom - content_.top) * (gy + 0.5f) / 6.f};
-          hidden_pts += covered(q) ? 1 : 0;
-        }
-      if (hidden_pts >= 34) step_aside = true;
-    }
-  }
-  overlay_.set_visible(!step_aside);
-  // Visible to Discord, OBS and screenshots, unless the page is read by copying
-  // the screen (then the spider would read itself) or the user turned it off.
-  overlay_.set_capturable(settings_.share && (!root_ || !content_known_ || vision_.state().window_capture));
-  if (step_aside) {
-    Sleep(15);  // nothing to draw; do not spin
-    return;
-  }
-
-  // Gone completely, not just faded, when another window is over it.
-  const bool hidden = root_ && covered(spider_screen) && !pet_.dragging();
-  dim_ = lerp(dim_, hidden ? 1.f : 0.f, damp(10.f, dt));
-
-  if (ID2D1DeviceContext* ctx = overlay_.begin()) {
-    painter_.attach(ctx, overlay_.d2d(), overlay_.dwrite());
-    const RECT b = overlay_.bounds();
-    const Vec2 origin{static_cast<float>(-b.left), static_cast<float>(-b.top)};
-    const Vec2 to_local = origin - offset();
-    const Rect area = root_ ? to_rect(content_) : to_rect(b);
-    const Rect clip = area.moved(origin.x, origin.y);
-    // Windows stacked over the page: harvested marks must not paint over them.
-    std::vector<Rect> holes;
-    if (root_)
-      for (const RECT& r : above_) {
-        RECT hit;
-        if (IntersectRect(&hit, &r, &content_)) holes.push_back(to_rect(hit).moved(origin.x, origin.y));
-      }
-    scene_.draw(painter_, page_, pet_, settings_, to_local, clip, holes, now, dim_, dt);
-    overlay_.end();
-  }
-}
-
-void App::seek(const Record& r, double now) {
-  const Entity* e = (root_ && r.page == page_id_) ? page_.find(r.entity) : nullptr;
-  if (!e) {
-    // Not on the page we are on now: open where it came from, if that is a web address.
-    const std::string where = !r.url.empty() ? r.url : r.source;
-    if (where.rfind("http", 0) == 0) ShellExecuteW(nullptr, L"open", wide(where).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-    else panel_.notice("That page is not open in front of the spider anymore.");
-    return;
-  }
-  SetForegroundWindow(root_);
-  seek_ = r.entity;
-  seek_until_ = now + 8.0;
-  seek_step_at_ = 0;
-}
-
-void App::handle(const PanelActions& a, double now) {
-  if (a.show >= 0 && a.show < static_cast<int>(store_.all().size())) seek(store_.all()[a.show], now);
-  if (!a.open_url.empty()) ShellExecuteW(nullptr, L"open", wide(a.open_url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-  if (!a.clip.empty()) {
-    copy_text(panel_hwnd_, a.clip);
-    panel_.notice("Copied.");
-  }
-  if (a.reroll) pet_.reroll_name();
-  if (a.recall) {
-    detach();
-    RECT pr;
-    GetWindowRect(panel_hwnd_, &pr);
-    free_ = monitor_rect({(pr.left + pr.right) / 2, (pr.top + pr.bottom) / 2}, true);
-    pet_.summon({(free_.left + free_.right) * 0.5f, free_.top + (free_.bottom - free_.top) * 0.4f}, view(), now);
-  }
-  if (a.clear_marks) {
-    for (Entity& e : page_.entities())
-      if (e.mark == Mark::Done) e.mark = Mark::Skip;
-    pet_.clear_silk();
-  }
-  if (a.save_json) {
-    const std::wstring p = store_.save_json();
-    panel_.notice(p.empty() ? "Could not save." : "Saved " + utf8(p));
-  }
-  if (a.save_csv) {
-    const std::wstring p = store_.save_csv();
-    panel_.notice(p.empty() ? "Could not save." : "Saved " + utf8(p));
-  }
-  if (a.copy) {
-    copy_text(panel_hwnd_, store_.as_text());
-    panel_.notice("Copied " + std::to_string(store_.all().size()) + " items.");
-  }
-  if (a.open_folder) ShellExecuteW(nullptr, L"open", documents_dir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-  if (a.clear_list) store_.clear();
-  if (a.settings_changed) save_settings(settings_);
-}
-
-int App::run(HINSTANCE inst, const Options& opt) {
-  settings_ = load_settings();
-  if (!panel_.create(inst, opt.quiet, opt.panel_at ? &opt.panel_pos : nullptr)) return 1;
-  panel_hwnd_ = panel_.hwnd();
-  if (!overlay_.create(inst)) {
-    MessageBoxW(panel_hwnd_, L"Could not create the spider window (Direct2D).", L"SpiderPet", MB_ICONERROR);
-    return 1;
-  }
-  RegisterHotKey(overlay_.hwnd(), 1, MOD_ALT | MOD_SHIFT | MOD_NOREPEAT, 'S');
-  vision_.start();
-  inspector_.start();
-  llm_.start();
-
-  overlay_.on_mouse = [this](Overlay::MouseEvent ev, POINT p) {
-    const double now = now_seconds();
-    if (ev == Overlay::MouseEvent::Double) {
-      if (scene_.bubble_hit(local(p))) scene_.unpin_bubble();  // back to following the spider
-      return;
-    }
-    if (ev == Overlay::MouseEvent::Down) {
-      if (pet_.hit(to_content(p))) {
-        pet_.grab(to_content(p), now);
-      } else if (scene_.bubble_hit(local(p))) {
-        bubble_drag_ = true;
-        bubble_grab_ = scene_.bubble_anchor() - local(p);
-      }
-    } else if (ev == Overlay::MouseEvent::Move) {
-      if (pet_.dragging()) pet_.drag(to_content(p), now);
-      if (bubble_drag_) scene_.pin_bubble(local(p) + bubble_grab_);
-    } else if (bubble_drag_) {
-      bubble_drag_ = false;
-    } else if (pet_.dragging()) {
-      pet_.release(now);
-      const HWND w = window_at(p);
-      if (!w) {
-        detach();
-        free_ = monitor_rect(p, true);
-      } else if (w != root_) {
-        attach(w, p, now);
-      }
-    }
-  };
-  // Alt+Shift+S: the spider rappels down onto whatever is under the mouse.
-  overlay_.on_hotkey = [this] {
-    const double now = now_seconds();
-    POINT c;
-    GetCursorPos(&c);
-    const HWND w = window_at(c);
-    if (!w) {
-      detach();
-      free_ = monitor_rect(c, true);
-    } else if (w != root_) {
-      attach(w, c, now);
-    }
-    pet_.summon(to_content(c), view(), now);
-  };
-
-  RECT pr;
-  GetWindowRect(panel_hwnd_, &pr);
-  free_ = monitor_rect({(pr.left + pr.right) / 2, (pr.top + pr.bottom) / 2}, true);
-  pet_.set_scale(dpi_scale({free_.left + 10, free_.top + 10}) * settings_.size);
-
-  HWND start_on = nullptr;
-  if (!opt.attach_title.empty()) {
-    struct Find {
-      std::wstring want;
-      HWND hit = nullptr;
-    } find{opt.attach_title, nullptr};
-    EnumWindows(
-        [](HWND h, LPARAM lp) -> BOOL {
-          auto* f = reinterpret_cast<Find*>(lp);
-          const std::wstring cls = class_of(h);
-          if (cls == L"SpiderPetOverlay" || cls == L"SpiderPetPanel") return TRUE;
-          if (IsWindowVisible(h) && !IsIconic(h) && title_of(h).find(f->want) != std::wstring::npos) {
-            f->hit = h;
-            return FALSE;
-          }
-          return TRUE;
-        },
-        reinterpret_cast<LPARAM>(&find));
-    start_on = find.hit;
-  }
-  const double t0 = now_seconds();
-  if (start_on) {
-    RECT r;
-    GetWindowRect(start_on, &r);
-    const POINT c{(r.left + r.right) / 2, r.top + (r.bottom - r.top) / 3};
-    attach(start_on, c, t0);
-    pet_.summon(to_content(c), view(), t0 + 0.3);
-  } else {
-    pet_.summon({free_.left + (free_.right - free_.left) * 0.62f, free_.top + (free_.bottom - free_.top) * 0.4f},
-                view(), t0 + 0.3);
-  }
-
-  double last = now_seconds(), panel_at = 0;
+  double saved_at = now_seconds();
   MSG msg;
-  bool quit = false;
-  while (!quit && !panel_.closed()) {
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-      if (msg.message == WM_QUIT) quit = true;
-      TranslateMessage(&msg);
-      DispatchMessageW(&msg);
+  while (!quitting_) {
+    if (visible_) {
+      while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        if (msg.message == WM_QUIT) quitting_ = true;
+      }
+      if (quitting_) break;
+      draw();
+    } else {
+      // Hidden in the tray: sleep until something happens.
+      MsgWaitForMultipleObjects(0, nullptr, FALSE, 1000, QS_ALLINPUT);
+      while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        if (msg.message == WM_QUIT) quitting_ = true;
+      }
     }
-    const double now = now_seconds();
-    if (opt.seconds > 0 && now - t0 > opt.seconds) break;
-    const float dt = static_cast<float>(std::min(0.05, now - last));
-    last = now;
-    frame(now, dt);
-    if (now - panel_at > 1.0 / 30) {
-      panel_at = now;
-      PanelModel m;
-      m.name = pet_.name();
-      m.state = pet_.state_name();
-      m.where = root_ ? page_key(title_) : L"";
-      m.thought = pet_.thought();
-      m.mind.assign(pet_.history().begin(), pet_.history().end());
-      m.now = now;
-      m.gist = pet_.gist();
-      m.brain = settings_.brain ? llm_.status() : "off";
-      m.reader_ready = vision_.reader_ready() || now - t0 < 3;
-      m.attached = root_ != nullptr;
-      m.found = static_cast<int>(page_.entities().size());
-      m.harvested = page_.harvested();
-      m.store = &store_;
-      handle(panel_.draw(m, settings_), now);
+    if (now_seconds() - saved_at > 3.0) {
+      saved_at = now_seconds();
+      std::lock_guard lock(mu_);
+      lib_.save();
     }
   }
 
-  UnregisterHotKey(overlay_.hwnd(), 1);
-  llm_.stop();
-  inspector_.stop();
-  vision_.stop();
-  overlay_.destroy();
-  panel_.destroy();
+  quit_ = true;
+  cv_.notify_all();
+  bridge_.stop();
+  if (worker_.joinable()) worker_.join();
+  {
+    std::lock_guard lock(mu_);
+    lib_.save();
+  }
+  settings_.save();
+  tray_remove();
+  destroy_window();
   return 0;
 }
 
-}  // namespace
+// ---------------------------------------------------------------- the brain
+
+json App::state_msg() {
+  return {{"type", "state"}, {"app", kVersion}, {"settings", settings_.to_json()}, {"status", status_}};
+}
+
+void App::on_message(int client, const json& m) {
+  const std::string type = jstr(m, "type");
+  std::unique_lock lock(mu_);
+  if (type == "hello") {
+    browsers_[client] = jstr(m, "browser").empty() ? "browser" : jstr(m, "browser");
+    const json st = state_msg();
+    lock.unlock();
+    bridge_.send(client, st);
+    wake();
+    return;
+  }
+  if (type == "page") {
+    const std::string url = jstr(m, "url");
+    if (url.empty()) return;
+    active_url_ = url;
+    lib_.touch_page(url, jstr(m, "title"), jstr(m, "lang"));
+    const json* p = lib_.page(url);
+    const bool has_gist = p && p->contains("gist") && (*p)["gist"].is_object() && !(*p)["gist"].contains("error");
+    if (has_gist) {
+      const json g = {{"type", "gist"}, {"url", url}, {"gist", (*p)["gist"]}};
+      lock.unlock();
+      bridge_.send(client, g);
+    } else if (!jstr(m, "text").empty()) {
+      urgent_.push_back({Job::Gist, url, "", {{"title", jstr(m, "title")}, {"text", jstr(m, "text")}}});
+      cv_.notify_all();
+    }
+    wake();
+    return;
+  }
+  if (type == "finds") {
+    const std::string url = jstr(m, "url");
+    if (url.empty()) return;
+    active_url_ = url;
+    const json& finds = m.contains("finds") ? m["finds"] : json::array();
+    const auto fresh = lib_.add(url, jstr(m, "title"), jstr(m, "lang"), finds);
+    // What was already known from an earlier visit goes straight back.
+    json known = json::object();
+    std::vector<std::string> unranked;
+    for (const json& f : finds) {
+      const std::string id = jstr(f, "id");
+      const json* x = lib_.find(id);
+      if (!x) continue;
+      const json& v = (*x)["verdict"];
+      const int score = (*x).value("score", -1);
+      if (v.is_object() || score >= 0) known[id] = {{"verdict", v}, {"score", score}};
+      if (score < 0 && rankable(*x)) unranked.push_back(id);
+      if (settings_.auto_check && !v.is_object() && checkable(*x, settings_)) queue_check(id, false);
+    }
+    lock.unlock();
+    if (!known.empty()) bridge_.send(client, {{"type", "known"}, {"url", url}, {"items", known}});
+    lock.lock();
+    // Ranking only means something against a goal; without one, the whole page is on topic.
+    if (!unranked.empty() && !settings_.goal.empty()) queue_rank(url, unranked);
+    wake();
+    return;
+  }
+  if (type == "check") {
+    const std::string id = jstr(m, "id");
+    if (lib_.find(id)) {
+      lib_.set_verdict(id, nullptr);
+      queue_check(id, true);
+    }
+    wake();
+    return;
+  }
+  if (type == "soon") {
+    // The spider just ate it: its check moves to the front.
+    const std::string id = jstr(m, "id");
+    auto it = std::find_if(jobs_.begin(), jobs_.end(), [&](const Job& j) { return j.type == Job::Check && j.id == id; });
+    if (it != jobs_.end()) {
+      urgent_.push_front(std::move(*it));
+      jobs_.erase(it);
+      cv_.notify_all();
+    }
+    return;
+  }
+  if (type == "settings") {
+    lock.unlock();
+    apply_settings(m.value("settings", json::object()));
+    return;
+  }
+  if (type == "open-app") {
+    lock.unlock();
+    if (hwnd_) PostMessageW(hwnd_, kShowMsg, 0, 0);
+    return;
+  }
+}
+
+void App::on_gone(int client) {
+  std::lock_guard lock(mu_);
+  browsers_.erase(client);
+  wake();
+}
+
+// Called with mu_ held.
+void App::queue_check(const std::string& id, bool urgent) {
+  if (queued_.count(id)) return;
+  queued_.insert(id);
+  lib_.set_verdict(id, {{"status", "queued"}});
+  (urgent ? urgent_ : jobs_).push_back({Job::Check, "", id, nullptr});
+  cv_.notify_all();
+}
+
+// Called with mu_ held. Batches of 40: one model call each.
+void App::queue_rank(const std::string& url, const std::vector<std::string>& all) {
+  std::vector<std::string> ids;
+  for (const std::string& id : all)
+    if (const json* f = lib_.find(id); f && rankable(*f)) ids.push_back(id);
+  for (size_t i = 0; i < ids.size(); i += 40) {
+    json items = json::array();
+    for (size_t k = i; k < ids.size() && k < i + 40; ++k)
+      if (const json* f = lib_.find(ids[k])) {
+        // An id alone says nothing; the citation around it does.
+        const std::string kind = jstr(*f, "kind");
+        std::string text = jstr(*f, "text");
+        if ((kind == "doi" || kind == "isbn" || kind == "id") && !jstr(*f, "context").empty())
+          text = kind + " " + text + " in: " + jstr(*f, "context").substr(0, 220);
+        items.push_back({{"id", ids[k]}, {"kind", kind}, {"text", text}});
+      }
+    if (!items.empty()) urgent_.push_back({Job::Rank, url, "", items});
+  }
+  cv_.notify_all();
+}
+
+void App::rerank(const std::string& url) {
+  std::lock_guard lock(mu_);
+  if (url.empty()) return;
+  std::erase_if(urgent_, [&](const Job& j) { return j.type == Job::Rank && j.url == url; });
+  queue_rank(url, lib_.finds_of(url));
+}
+
+void App::apply_settings(const json& partial) {
+  json out;
+  {
+    std::lock_guard lock(mu_);
+    const std::string old_goal = settings_.goal;
+    const std::string old_model = settings_.model;
+    settings_.from_json(partial);
+    settings_.save();
+    if (settings_.model != old_model) checker_.set_model(settings_.model);
+    snprintf(goal_, sizeof(goal_), "%s", settings_.goal.c_str());
+    out = {{"type", "settings"}, {"settings", settings_.to_json()}};
+    if (settings_.goal != old_goal && !active_url_.empty()) {
+      std::erase_if(urgent_, [&](const Job& j) { return j.type == Job::Rank; });
+      queue_rank(active_url_, lib_.finds_of(active_url_));
+    }
+  }
+  bridge_.broadcast(out);
+  wake();
+}
+
+void App::reveal(const std::string& url, const std::string& id) {
+  bridge_.broadcast({{"type", "reveal"}, {"url", url}, {"id", id}});
+}
+
+void App::worker() {
+  CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  double status_at = -100;
+  while (!quit_) {
+    Job job;
+    {
+      std::unique_lock lock(mu_);
+      cv_.wait_for(lock, std::chrono::seconds(5), [&] { return quit_.load() || !urgent_.empty() || !jobs_.empty(); });
+      if (quit_) break;
+      if (urgent_.empty() && jobs_.empty()) {
+        lock.unlock();
+        const json st = checker_.status();
+        lock.lock();
+        if (st != status_) {
+          status_ = st;
+          const json msg = state_msg();
+          lock.unlock();
+          bridge_.broadcast(msg);
+          wake();
+        }
+        continue;
+      }
+      std::deque<Job>& q = urgent_.empty() ? jobs_ : urgent_;
+      job = std::move(q.front());
+      q.pop_front();
+    }
+    if (now_seconds() - status_at > 15) {
+      status_at = now_seconds();
+      const json st = checker_.status();
+      std::lock_guard lock(mu_);
+      status_ = st;
+    }
+
+    if (job.type == Job::Check) {
+      json find, page;
+      bool online;
+      {
+        std::lock_guard lock(mu_);
+        queued_.erase(job.id);
+        const json* f = lib_.find(job.id);
+        if (!f) continue;
+        find = *f;
+        const json* p = lib_.page(jstr(find, "url"));
+        page = {{"url", jstr(find, "url")}, {"title", p ? jstr(*p, "title") : ""}, {"lang", p ? jstr(*p, "lang") : ""}};
+        online = settings_.online;
+        busy_ = "checking: " + jstr(find, "text").substr(0, 60);
+        lib_.set_verdict(job.id, {{"status", "checking"}});
+      }
+      wake();
+      bridge_.broadcast({{"type", "verdict"}, {"url", jstr(find, "url")}, {"id", job.id}, {"verdict", {{"status", "checking"}}}});
+      const json v = checker_.check(find, page, online);
+      const int tries = job.data.is_object() ? job.data.value("tries", 0) : 0;
+      {
+        std::lock_guard lock(mu_);
+        busy_.clear();
+        // A source that failed now gets one more go at the end of the line.
+        if (jstr(v, "status") == "error" && tries < 1 && !queued_.count(job.id)) {
+          queued_.insert(job.id);
+          lib_.set_verdict(job.id, {{"status", "queued"}});
+          jobs_.push_back({Job::Check, "", job.id, {{"tries", tries + 1}}});
+          continue;
+        }
+        lib_.set_verdict(job.id, v);
+      }
+      bridge_.broadcast({{"type", "verdict"}, {"url", jstr(find, "url")}, {"id", job.id}, {"verdict", v}});
+    } else if (job.type == Job::Rank) {
+      std::string goal, title;
+      {
+        std::lock_guard lock(mu_);
+        goal = settings_.goal;
+        const json* p = lib_.page(job.url);
+        title = p ? jstr(*p, "title") : "";
+        busy_ = "ranking what matters";
+      }
+      wake();
+      const json r = checker_.rank(goal, title, job.data);
+      json scores = r.value("scores", json::object());
+      {
+        std::lock_guard lock(mu_);
+        for (auto& [id, sc] : scores.items())
+          if (sc.is_number()) lib_.set_score(id, sc.get<int>());
+        busy_.clear();
+      }
+      if (!scores.empty()) bridge_.broadcast({{"type", "scores"}, {"url", job.url}, {"scores", scores}});
+    } else if (job.type == Job::Gist) {
+      {
+        std::lock_guard lock(mu_);
+        busy_ = "reading the page";
+      }
+      wake();
+      const json g = checker_.gist(jstr(job.data, "title"), job.url, jstr(job.data, "text"));
+      {
+        std::lock_guard lock(mu_);
+        if (!g.contains("error")) lib_.set_gist(job.url, g);
+        busy_.clear();
+      }
+      bridge_.broadcast({{"type", "gist"}, {"url", job.url}, {"gist", g}});
+    }
+    wake();
+  }
+  CoUninitialize();
+}
+
+// ---------------------------------------------------------------- window
+
+bool App::create_window(HINSTANCE inst, bool show_now) {
+  WNDCLASSEXW wc{sizeof(wc)};
+  wc.style = CS_HREDRAW | CS_VREDRAW;
+  wc.lpfnWndProc = &App::proc;
+  wc.hInstance = inst;
+  wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+  wc.hIconSm = wc.hIcon;
+  wc.hbrBackground = CreateSolidBrush(RGB(0x0E, 0x0F, 0x14));
+  wc.lpszClassName = L"SpiderPetApp";
+  RegisterClassExW(&wc);
+  hwnd_ = CreateWindowExW(0, wc.lpszClassName, L"SpiderPet", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 560, 820,
+                          nullptr, nullptr, inst, this);
+  if (!hwnd_) return false;
+  scale_ = GetDpiForWindow(hwnd_) / 96.f;
+  SetWindowPos(hwnd_, nullptr, 0, 0, static_cast<int>(560 * scale_), static_cast<int>(820 * scale_),
+               SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+  const BOOL dark = TRUE;
+  DwmSetWindowAttribute(hwnd_, 20, &dark, sizeof(dark));
+  const COLORREF caption = 0x00140F0E;
+  DwmSetWindowAttribute(hwnd_, 35, &caption, sizeof(caption));
+
+  if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device_,
+                               nullptr, &ctx_)))
+    return false;
+  ComPtr<IDXGIDevice> dxgi;
+  device_.As(&dxgi);
+  ComPtr<IDXGIAdapter> adapter;
+  dxgi->GetAdapter(&adapter);
+  ComPtr<IDXGIFactory2> factory;
+  adapter->GetParent(IID_PPV_ARGS(&factory));
+  DXGI_SWAP_CHAIN_DESC1 sd{};
+  sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  sd.SampleDesc.Count = 1;
+  sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+  sd.BufferCount = 2;
+  sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  if (FAILED(factory->CreateSwapChainForHwnd(device_.Get(), hwnd_, &sd, nullptr, nullptr, &swap_))) return false;
+  factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
+  make_target();
+
+  IMGUI_CHECKVERSION();
+  imgui_ = ImGui::CreateContext();
+  ImGui::SetCurrentContext(imgui_);
+  ImGuiIO& io = ImGui::GetIO();
+  io.IniFilename = nullptr;
+  ImFontConfig cfg;
+  cfg.OversampleH = 2;
+  // Latin, Greek, Cyrillic and general punctuation: titles and names in other scripts.
+  static const ImWchar ranges[] = {0x0020, 0x024F, 0x0370, 0x03FF, 0x0400, 0x04FF, 0x2000, 0x206F, 0x2190, 0x21FF, 0};
+  body_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 16.f * scale_, &cfg, ranges);
+  bold_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\seguisb.ttf", 16.f * scale_, &cfg, ranges);
+  title_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 24.f * scale_, &cfg, ranges);
+  small_ = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 13.5f * scale_, &cfg, ranges);
+  if (!body_) body_ = io.Fonts->AddFontDefault();
+  if (!bold_) bold_ = body_;
+  if (!title_) title_ = body_;
+  if (!small_) small_ = body_;
+  style();
+  ImGui_ImplWin32_Init(hwnd_);
+  ImGui_ImplDX11_Init(device_.Get(), ctx_.Get());
+  if (show_now) show();
+  return true;
+}
+
+void App::make_target() {
+  rtv_.Reset();
+  ComPtr<ID3D11Texture2D> back;
+  if (SUCCEEDED(swap_->GetBuffer(0, IID_PPV_ARGS(&back)))) device_->CreateRenderTargetView(back.Get(), nullptr, &rtv_);
+}
+
+void App::destroy_window() {
+  if (imgui_) {
+    ImGui::SetCurrentContext(imgui_);
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext(imgui_);
+    imgui_ = nullptr;
+  }
+  rtv_.Reset();
+  swap_.Reset();
+  ctx_.Reset();
+  device_.Reset();
+  if (hwnd_) DestroyWindow(hwnd_);
+  hwnd_ = nullptr;
+}
+
+void App::show() {
+  ShowWindow(hwnd_, IsIconic(hwnd_) ? SW_RESTORE : SW_SHOW);
+  SetForegroundWindow(hwnd_);
+  visible_ = true;
+}
+
+void App::hide() {
+  ShowWindow(hwnd_, SW_HIDE);
+  visible_ = false;
+}
+
+void App::tray_add() {
+  tray_.cbSize = sizeof(tray_);
+  tray_.hWnd = hwnd_;
+  tray_.uID = 1;
+  tray_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+  tray_.uCallbackMessage = kTrayMsg;
+  tray_.hIcon = LoadIconW(inst_, MAKEINTRESOURCEW(1));
+  wcscpy_s(tray_.szTip, L"SpiderPet");
+  Shell_NotifyIconW(NIM_ADD, &tray_);
+}
+
+void App::tray_remove() { Shell_NotifyIconW(NIM_DELETE, &tray_); }
+
+LRESULT CALLBACK App::proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+  if (msg == WM_NCCREATE) {
+    auto* cs = reinterpret_cast<CREATESTRUCTW*>(lp);
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+  }
+  auto* self = reinterpret_cast<App*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+  if (self && (self->hwnd_ == hwnd || !self->hwnd_)) {
+    if (!self->hwnd_) self->hwnd_ = hwnd;
+    return self->handle(msg, wp, lp);
+  }
+  return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
+  if (imgui_) {
+    ImGui::SetCurrentContext(imgui_);
+    if (ImGui_ImplWin32_WndProcHandler(hwnd_, msg, wp, lp)) return TRUE;
+  }
+  switch (msg) {
+    case WM_SIZE:
+      if (swap_ && wp != SIZE_MINIMIZED) {
+        rtv_.Reset();
+        swap_->ResizeBuffers(0, LOWORD(lp), HIWORD(lp), DXGI_FORMAT_UNKNOWN, 0);
+        make_target();
+      }
+      if (wp == SIZE_MINIMIZED) visible_ = false;
+      else if (IsWindowVisible(hwnd_)) visible_ = true;
+      return 0;
+    case WM_DPICHANGED: {
+      const RECT* r = reinterpret_cast<const RECT*>(lp);
+      SetWindowPos(hwnd_, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+      return 0;
+    }
+    case WM_GETMINMAXINFO: {
+      auto* mm = reinterpret_cast<MINMAXINFO*>(lp);
+      mm->ptMinTrackSize = {static_cast<LONG>(420 * scale_), static_cast<LONG>(480 * scale_)};
+      return 0;
+    }
+    case WM_CLOSE:
+      hide();  // the browser stays connected; quit from the tray
+      return 0;
+    case kShowMsg:
+      show();
+      return 0;
+    case kTrayMsg:
+      if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
+        show();
+      } else if (LOWORD(lp) == WM_RBUTTONUP) {
+        HMENU m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING, 1, L"Open SpiderPet");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, 2, L"Quit");
+        POINT p;
+        GetCursorPos(&p);
+        SetForegroundWindow(hwnd_);
+        const int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, hwnd_, nullptr);
+        DestroyMenu(m);
+        if (cmd == 1) show();
+        if (cmd == 2) quitting_ = true;
+      }
+      return 0;
+    case WM_ERASEBKGND:
+      return 1;
+    default:
+      break;
+  }
+  return DefWindowProcW(hwnd_, msg, wp, lp);
+}
+
+void App::style() {
+  ImGuiStyle& s = ImGui::GetStyle();
+  s.WindowRounding = 0;
+  s.ChildRounding = 8;
+  s.FrameRounding = 6;
+  s.GrabRounding = 6;
+  s.PopupRounding = 6;
+  s.TabRounding = 6;
+  s.WindowPadding = ImVec2(18, 16);
+  s.FramePadding = ImVec2(10, 6);
+  s.ItemSpacing = ImVec2(8, 8);
+  s.ScrollbarSize = 10;
+  s.WindowBorderSize = 0;
+  s.ChildBorderSize = 0;
+  ImVec4* c = s.Colors;
+  c[ImGuiCol_WindowBg] = hexv(0x0E0F14);
+  c[ImGuiCol_ChildBg] = hexv(0x15161D);
+  c[ImGuiCol_PopupBg] = hexv(0x1B1C25);
+  c[ImGuiCol_Text] = hexv(0xE9EBF2);
+  c[ImGuiCol_TextDisabled] = hexv(0x8A8FA3);
+  c[ImGuiCol_FrameBg] = hexv(0x1E2029);
+  c[ImGuiCol_FrameBgHovered] = hexv(0x272A36);
+  c[ImGuiCol_FrameBgActive] = hexv(0x2E3240);
+  c[ImGuiCol_Button] = hexv(0x22242F);
+  c[ImGuiCol_ButtonHovered] = hexv(0x2F3242);
+  c[ImGuiCol_ButtonActive] = hexv(0x3A3E52);
+  c[ImGuiCol_CheckMark] = hexv(0x8BF5A6);
+  c[ImGuiCol_Header] = hexv(0x1A1B23);
+  c[ImGuiCol_HeaderHovered] = hexv(0x23252F);
+  c[ImGuiCol_HeaderActive] = hexv(0x2A2D3B);
+  c[ImGuiCol_Tab] = hexv(0x15161D);
+  c[ImGuiCol_TabHovered] = hexv(0x2A2D3B);
+  c[ImGuiCol_TabSelected] = hexv(0x262838);
+  c[ImGuiCol_TabSelectedOverline] = hexv(0xE64CF2);
+  c[ImGuiCol_Separator] = hexv(0xFFFFFF, 0.08f);
+  c[ImGuiCol_ScrollbarBg] = hexv(0x000000, 0);
+  c[ImGuiCol_ScrollbarGrab] = hexv(0x2E3140);
+  c[ImGuiCol_Border] = hexv(0xFFFFFF, 0.06f);
+  s.ScaleAllSizes(scale_);
+}
+
+void App::draw() {
+  if (!rtv_ || IsIconic(hwnd_)) {
+    Sleep(30);
+    return;
+  }
+  ImGui::SetCurrentContext(imgui_);
+  ImGui_ImplDX11_NewFrame();
+  ImGui_ImplWin32_NewFrame();
+  ImGui::NewFrame();
+  const ImGuiViewport* vp = ImGui::GetMainViewport();
+  ImGui::SetNextWindowPos(vp->WorkPos);
+  ImGui::SetNextWindowSize(vp->WorkSize);
+  ImGui::Begin("##app", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+  {
+    std::lock_guard lock(mu_);
+    draw_header();
+    if (ImGui::BeginTabBar("##tabs")) {
+      if (ImGui::BeginTabItem("This page")) {
+        draw_page();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Library")) {
+        draw_library();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Settings")) {
+        draw_settings();
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Setup")) {
+        draw_setup();
+        ImGui::EndTabItem();
+      }
+      ImGui::EndTabBar();
+    }
+  }
+  ImGui::End();
+  if (!pending_.is_null()) {
+    const json partial = std::move(pending_);
+    pending_ = nullptr;
+    apply_settings(partial);
+  }
+  ImGui::Render();
+  const float clear[4] = {0.055f, 0.059f, 0.078f, 1.f};
+  ctx_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
+  ctx_->ClearRenderTargetView(rtv_.Get(), clear);
+  ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+  swap_->Present(1, 0);
+}
+
+void App::draw_header() {
+  ImGui::PushFont(title_, title_->LegacySize);
+  ImGui::TextUnformatted("SpiderPet");
+  ImGui::PopFont();
+
+  // One status line: browsers, the model, online checks, the queue.
+  ImGui::PushFont(small_, small_->LegacySize);
+  auto dot = [&](bool ok) {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float r = 4.f * scale_;
+    ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + r, p.y + ImGui::GetTextLineHeight() * 0.5f), r,
+                                                ImGui::GetColorU32(hexv(ok ? 0x8BF5A6 : 0xFF5C5C)));
+    ImGui::Dummy(ImVec2(r * 2 + 4 * scale_, ImGui::GetTextLineHeight()));
+    ImGui::SameLine(0, 0);
+  };
+  std::set<std::string> names;
+  for (auto& [c, n] : browsers_) names.insert(n);
+  std::string b;
+  for (const auto& n : names) b += (b.empty() ? "" : ", ") + n;
+  dot(!names.empty());
+  ImGui::Text(names.empty() ? "no browser connected" : "%s connected", b.c_str());
+  ImGui::SameLine(0, 18 * scale_);
+  const bool ai = status_.value("ollama", false) && !jstr(status_, "model").empty();
+  dot(ai);
+  if (ai) ImGui::Text("AI: %s", jstr(status_, "model").c_str());
+  else ImGui::TextUnformatted(status_.value("ollama", false) ? "AI: no model installed" : "AI: Ollama is not running");
+  ImGui::SameLine(0, 18 * scale_);
+  dot(settings_.online);
+  ImGui::TextUnformatted(settings_.online ? "online checks on" : "online checks off");
+  const size_t waiting = queued_.size();
+  if (!busy_.empty() || waiting) {
+    ImGui::TextDisabled("%s%s", busy_.empty() ? "" : busy_.c_str(),
+                        waiting ? ("   (" + std::to_string(waiting) + " waiting)").c_str() : "");
+  }
+  ImGui::PopFont();
+
+  ImGui::SetNextItemWidth(-1);
+  if (ImGui::InputTextWithHint("##goal", "What are you looking for? The spider goes after that first.", goal_, sizeof(goal_),
+                               ImGuiInputTextFlags_EnterReturnsTrue) ||
+      (ImGui::IsItemDeactivatedAfterEdit())) {
+    pending_ = {{"goal", std::string(goal_)}};  // applied after this frame, outside the lock
+  }
+  if (!notice_.empty() && now_seconds() - notice_at_ < 4) ImGui::TextColored(hexv(0x8BF5A6), "%s", notice_.c_str());
+  ImGui::Spacing();
+}
+
+void App::draw_find(const json& f, bool show_page) {
+  const std::string id = jstr(f, "id");
+  const std::string kind = jstr(f, "kind");
+  const json& v = f.contains("verdict") ? f["verdict"] : json();
+  ImGui::PushID(id.c_str());
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const float pad = 4.f * scale_;
+
+  // Kind tag and verdict pill on one line.
+  ImGui::PushFont(small_, small_->LegacySize);
+  std::string tag = kind == "id" && !jstr(f, "label").empty() ? jstr(f, "label") : kind;
+  for (char& c : tag) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  ImGui::TextColored(hexv(kind_color(kind)), "%s", tag.c_str());
+  const Pill pill = pill_for(v);
+  if (pill.text[0]) {
+    ImGui::SameLine();
+    const ImVec2 sz = ImGui::CalcTextSize(pill.text);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    dl->AddRectFilled(ImVec2(p.x - pad, p.y - 1), ImVec2(p.x + sz.x + pad, p.y + sz.y + 1), ImGui::GetColorU32(hexv(pill.bg)),
+                      4.f * scale_);
+    ImGui::TextColored(hexv(pill.fg), "%s", pill.text);
+  }
+  const int score = f.value("score", -1);
+  if (score >= 0) {
+    ImGui::SameLine(0, 12 * scale_);
+    ImGui::TextDisabled("relevance %d/10", score);
+  }
+  ImGui::PopFont();
+
+  // The find itself; click to see it on the page.
+  ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x + ImGui::GetCursorPosX() - 6 * scale_);
+  ImGui::PushFont(kind == "heading" || kind == "title" ? bold_ : body_, body_->LegacySize);
+  ImGui::TextUnformatted(jstr(f, "text").c_str());
+  ImGui::PopFont();
+  if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+  if (ImGui::IsItemClicked()) reveal(jstr(f, "url"), id);
+
+  ImGui::PushFont(small_, small_->LegacySize);
+  if (v.is_object()) {
+    const std::string note = jstr(v, "note");
+    if (!note.empty()) ImGui::TextDisabled("%s", note.c_str());
+    if (v.contains("quote") && v["quote"].is_string() && !v["quote"].get<std::string>().empty())
+      ImGui::TextColored(hexv(0xB9C0D8), "\"%s\"", jstr(v, "quote").c_str());
+    if (v.contains("source") && v["source"].is_object() && !jstr(v["source"], "url").empty()) {
+      const json& s = v["source"];
+      ImGui::TextColored(hexv(0x7FD6FF), "source: %s", jstr(s, "name").c_str());
+      if (ImGui::IsItemHovered()) {
+        ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::SetTooltip("%s", jstr(s, "url").c_str());
+      }
+      if (ImGui::IsItemClicked()) open_url(jstr(s, "url"));
+    }
+  }
+  if (show_page) ImGui::TextDisabled("%s", jstr(f, "title").c_str());
+  if (!jstr(f, "href").empty()) {
+    ImGui::TextColored(hexv(0x7D8BFF), "%s", jstr(f, "href").substr(0, 90).c_str());
+    if (ImGui::IsItemClicked()) open_url(jstr(f, "href"));
+  }
+  ImGui::PopFont();
+  ImGui::PopTextWrapPos();
+
+  ImGui::PushFont(small_, small_->LegacySize);
+  if (ImGui::SmallButton("Show on page")) reveal(jstr(f, "url"), id);
+  ImGui::SameLine();
+  if (ImGui::SmallButton("Copy")) {
+    copy_text(hwnd_, jstr(f, "text"));
+    notice_ = "copied";
+    notice_at_ = now_seconds();
+  }
+  if (checkable(f, settings_)) {
+    ImGui::SameLine();
+    if (ImGui::SmallButton(v.is_object() && jstr(v, "status") != "queued" && jstr(v, "status") != "checking" ? "Check again" : "Check")) {
+      lib_.set_verdict(id, nullptr);
+      queue_check(id, true);
+    }
+  }
+  ImGui::PopFont();
+  ImGui::Separator();
+  ImGui::PopID();
+}
+
+void App::draw_page() {
+  if (active_url_.empty()) {
+    ImGui::Spacing();
+    ImGui::TextWrapped("Open a page in your browser and press the spider button in the toolbar. "
+                       "What the spider finds shows up here, with a check for each find.");
+    if (!registered_) ImGui::TextColored(hexv(0xFF5C5C), "The browser connection is not set up. See Setup.");
+    return;
+  }
+  const json* p = lib_.page(active_url_);
+  if (!p) return;
+  ImGui::PushFont(bold_, bold_->LegacySize);
+  ImGui::TextWrapped("%s", jstr(*p, "title").c_str());
+  ImGui::PopFont();
+  ImGui::PushFont(small_, small_->LegacySize);
+  ImGui::TextColored(hexv(0x7D8BFF), "%s", active_url_.substr(0, 110).c_str());
+  if (ImGui::IsItemClicked()) open_url(active_url_);
+  ImGui::PopFont();
+  if (p->contains("gist") && (*p)["gist"].is_object() && !(*p)["gist"].contains("error")) {
+    const json& g = (*p)["gist"];
+    ImGui::BeginChild("##gist", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushFont(small_, small_->LegacySize);
+    ImGui::TextColored(hexv(0xE64CF2), "%s", jstr(g, "type").c_str());
+    ImGui::PopFont();
+    ImGui::TextWrapped("%s", jstr(g, "summary").c_str());
+    if (g.contains("points") && g["points"].is_array())
+      for (const json& pt : g["points"])
+        if (pt.is_string()) ImGui::BulletText("%s", pt.get<std::string>().c_str());
+    ImGui::EndChild();
+  }
+  ImGui::Spacing();
+
+  std::vector<const json*> list;
+  for (const std::string& id : lib_.finds_of(active_url_)) {
+    auto it = lib_.finds().find(id);
+    if (it != lib_.finds().end()) list.push_back(&*it);
+  }
+  // Most relevant first, problems before quiet ones at the same relevance.
+  std::stable_sort(list.begin(), list.end(), [](const json* a, const json* b) {
+    const int sa = a->value("score", -1), sb = b->value("score", -1);
+    if (sa != sb) return sa > sb;
+    return problem((*a)["verdict"]) && !problem((*b)["verdict"]);
+  });
+  int verified = 0, problems = 0;
+  for (const json* f : list) {
+    verified += jstr((*f)["verdict"], "status") == "verified" ? 1 : 0;
+    problems += problem((*f)["verdict"]) ? 1 : 0;
+  }
+  ImGui::PushFont(small_, small_->LegacySize);
+  ImGui::TextDisabled("%zu finds   %d verified   %d problems", list.size(), verified, problems);
+  ImGui::PopFont();
+  ImGui::BeginChild("##finds", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+  for (const json* f : list) draw_find(*f, false);
+  ImGui::EndChild();
+}
+
+void App::draw_library() {
+  ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
+  ImGui::InputTextWithHint("##search", "Search the library", search_, sizeof(search_));
+  ImGui::SameLine();
+  ImGui::SetNextItemWidth(-1);
+  const char* filters[] = {"All", "Verified", "Problems", "Unclear", "Not checked"};
+  ImGui::Combo("##status", &status_filter_, filters, 5);
+  const std::string q = lower(wide(search_)).empty() ? "" : utf8(lower(wide(search_)));
+
+  ImGui::BeginChild("##lib", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+  int shown = 0;
+  for (const std::string& url : lib_.page_order()) {
+    const json* p = lib_.page(url);
+    if (!p) continue;
+    std::vector<const json*> list;
+    for (const std::string& id : lib_.finds_of(url)) {
+      auto it = lib_.finds().find(id);
+      if (it == lib_.finds().end()) continue;
+      const json& f = *it;
+      const std::string st = jstr(f["verdict"], "status");
+      if (status_filter_ == 1 && st != "verified") continue;
+      if (status_filter_ == 2 && !problem(f["verdict"])) continue;
+      if (status_filter_ == 3 && st != "unverified") continue;
+      if (status_filter_ == 4 && !st.empty() && st != "skipped") continue;
+      if (!q.empty() && utf8(lower(wide(jstr(f, "text") + " " + jstr(f, "title")))).find(q) == std::string::npos) continue;
+      list.push_back(&f);
+    }
+    if (list.empty()) continue;
+    shown += static_cast<int>(list.size());
+    const std::string head = (jstr(*p, "title").empty() ? url : jstr(*p, "title")) + "  (" + std::to_string(list.size()) + ")##" + url;
+    if (ImGui::CollapsingHeader(head.c_str(), url == active_url_ ? ImGuiTreeNodeFlags_DefaultOpen : 0)) {
+      for (const json* f : list) draw_find(*f, false);
+      ImGui::PushFont(small_, small_->LegacySize);
+      if (ImGui::SmallButton(("Remove this page##" + url).c_str())) {
+        lib_.remove_page(url);
+        ImGui::PopFont();
+        break;
+      }
+      ImGui::PopFont();
+    }
+  }
+  if (shown == 0) ImGui::TextDisabled("Nothing here yet.");
+  ImGui::EndChild();
+}
+
+void App::draw_settings() {
+  bool changed = false;
+  Settings s = settings_;
+  ImGui::Spacing();
+  changed |= ImGui::Checkbox("Online checks", &s.online);
+  ImGui::PushFont(small_, small_->LegacySize);
+  ImGui::Indent();
+  ImGui::TextWrapped("Looks each find up in Crossref, OpenLibrary, Google Books, PubMed, arXiv and Wikipedia. "
+                     "Only the find leaves your PC (an id, a title, a few search words), never the page.");
+  ImGui::Unindent();
+  ImGui::PopFont();
+  changed |= ImGui::Checkbox("Check every find as it is harvested", &s.auto_check);
+  changed |= ImGui::Checkbox("Check claims in sentences too (slower)", &s.check_sentences);
+  changed |= ImGui::Checkbox("Let the spider scroll pages by itself", &s.crawl);
+
+  ImGui::Spacing();
+  ImGui::TextUnformatted("Model");
+  ImGui::SetNextItemWidth(260 * scale_);
+  const std::string current = s.model.empty() ? "best installed (" + jstr(status_, "model") + ")" : s.model;
+  if (ImGui::BeginCombo("##model", current.c_str())) {
+    if (ImGui::Selectable("best installed", s.model.empty())) s.model.clear(), changed = true;
+    for (const char* m : {"qwen3.8-27b-uncensored-64k", "qwen3:8b", "qwen3:14b", "qwen2.5:7b", "qwen2.5:3b"})
+      if (ImGui::Selectable(m, s.model == m)) s.model = m, changed = true;
+    ImGui::EndCombo();
+  }
+  if (changed) pending_ = s.to_json();
+
+  ImGui::Spacing();
+  ImGui::Separator();
+  ImGui::TextUnformatted("Library");
+  if (ImGui::Button("Save as JSON")) {
+    const std::wstring path = documents_dir() + L"\\SpiderPet-export.json";
+    lib_.export_json(path);
+    open_path(documents_dir());
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Save as CSV")) {
+    const std::wstring path = documents_dir() + L"\\SpiderPet-export.csv";
+    lib_.export_csv(path);
+    open_path(documents_dir());
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Open folder")) open_path(documents_dir());
+  ImGui::Spacing();
+  static double armed = 0;
+  if (ImGui::Button(now_seconds() - armed < 3 ? "Click again to clear everything" : "Clear library")) {
+    if (now_seconds() - armed < 3) {
+      lib_.clear();
+      armed = 0;
+    } else {
+      armed = now_seconds();
+    }
+  }
+}
+
+void App::draw_setup() {
+  ImGui::Spacing();
+  ImGui::PushTextWrapPos(0);
+  ImGui::TextColored(hexv(registered_ ? 0x8BF5A6 : 0xFF5C5C), registered_ ? "Browsers know where SpiderPet is."
+                                                                          : "Browser connection not set up.");
+  if (!registered_ && !register_error_.empty()) ImGui::TextDisabled("%s", utf8(register_error_).c_str());
+  if (ImGui::Button("Connect browsers again")) {
+    const std::wstring host = exe_dir() + L"\\SpiderHost.exe";
+    registered_ = register_native_host(host, &register_error_);
+  }
+  ImGui::Spacing();
+  ImGui::PushFont(bold_, bold_->LegacySize);
+  ImGui::TextUnformatted("Brave, Chrome, Edge");
+  ImGui::PopFont();
+  ImGui::TextUnformatted("1. Open brave://extensions (or chrome://extensions, edge://extensions).");
+  ImGui::TextUnformatted("2. Turn on Developer mode.");
+  ImGui::TextUnformatted("3. Click Load unpacked and pick the folder below.");
+  const std::wstring chromium = exe_dir() + L"\\extension\\chromium";
+  ImGui::TextColored(hexv(0x7D8BFF), "%s", utf8(chromium).c_str());
+  if (ImGui::Button("Open that folder")) open_path(chromium);
+  ImGui::Spacing();
+  ImGui::PushFont(bold_, bold_->LegacySize);
+  ImGui::TextUnformatted("Firefox");
+  ImGui::PopFont();
+  const std::wstring xpi = exe_dir() + L"\\extension\\spiderpet-firefox.xpi";
+  if (GetFileAttributesW(xpi.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    ImGui::TextUnformatted("Drag this file into a Firefox window and click Add:");
+    ImGui::TextColored(hexv(0x7D8BFF), "%s", utf8(xpi).c_str());
+    if (ImGui::Button("Show the file")) open_path(exe_dir() + L"\\extension");
+  } else {
+    ImGui::TextUnformatted("Firefox only installs extensions that Mozilla has signed.");
+    ImGui::TextUnformatted("Run extension\\sign-firefox.ps1 once with your addons.mozilla.org API key; it makes "
+                           "spiderpet-firefox.xpi here. Until then, load extension\\firefox\\manifest.json from "
+                           "about:debugging > This Firefox > Load Temporary Add-on (it lasts until Firefox restarts).");
+  }
+  ImGui::Spacing();
+  ImGui::PushFont(bold_, bold_->LegacySize);
+  ImGui::TextUnformatted("Local AI");
+  ImGui::PopFont();
+  ImGui::TextUnformatted("Ollama runs the checks. The smartest installed model is used: Qwen 3.8 27B "
+                         "(qwen3.8-27b-uncensored-64k) if you have it, then qwen3:8b and smaller ones.");
+  ImGui::PopTextWrapPos();
+}
+
+}  // namespace sp
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  Options opt;
   int argc = 0;
-  if (wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc)) {
-    for (int i = 1; i < argc; ++i) {
-      const std::wstring a = argv[i];
-      if (a == L"--attach" && i + 1 < argc) opt.attach_title = argv[++i];
-      else if (a == L"--seconds" && i + 1 < argc) opt.seconds = _wtof(argv[++i]);
-      else if (a == L"--quiet") opt.quiet = true;
-      else if (a == L"--second") opt.second = true;
-      else if (a == L"--panel" && i + 2 < argc) {
-        opt.panel_at = true;
-        opt.panel_pos = {_wtoi(argv[i + 1]), _wtoi(argv[i + 2])};
-        i += 2;
-      }
-    }
-    LocalFree(argv);
-  }
-  HANDLE once = opt.second ? nullptr : CreateMutexW(nullptr, TRUE, L"SpiderPet.SingleInstance");
-  if (once && GetLastError() == ERROR_ALREADY_EXISTS) {
-    if (HWND w = FindWindowW(L"SpiderPetPanel", nullptr)) {
-      ShowWindow(w, SW_RESTORE);
-      SetForegroundWindow(w);
-    }
+  wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  bool tray = false;
+  for (int i = 1; i < argc; ++i)
+    if (std::wstring(argv[i]) == L"--tray") tray = true;
+  LocalFree(argv);
+
+  // One app per user: a second start just brings the window up.
+  HANDLE once = CreateMutexW(nullptr, TRUE, L"Local\\SpiderPet.App");
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    if (!tray)
+      if (HWND w = FindWindowW(L"SpiderPetApp", nullptr)) PostMessageW(w, WM_APP + 2, 0, 0);
     return 0;
   }
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  int rc = 0;
-  {
-    App app;
-    rc = app.run(inst, opt);
-  }
+  sp::App app;
+  const int code = app.run(inst, tray);
   CoUninitialize();
   if (once) CloseHandle(once);
-  return rc;
+  return code;
 }

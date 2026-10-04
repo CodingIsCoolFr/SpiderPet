@@ -56,7 +56,13 @@ std::wstring app_data_dir() {
   }
   return known_folder(FOLDERID_RoamingAppData, L"SpiderPet");
 }
-std::wstring documents_dir() { return known_folder(FOLDERID_Documents, L"SpiderPet"); }
+std::wstring documents_dir() {
+  if (const wchar_t* dir = _wgetenv(L"SPIDERPET_DATA")) {  // tests keep away from the real library
+    CreateDirectoryW(dir, nullptr);
+    return dir;
+  }
+  return known_folder(FOLDERID_Documents, L"SpiderPet");
+}
 
 uint32_t fnv1a(std::wstring_view s) {
   uint32_t h = 2166136261u;

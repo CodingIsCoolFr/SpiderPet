@@ -2,4 +2,9 @@ build/
 .vs/
 *.user
 SpiderPet.exe
-SpiderPet.old.exe
+SpiderHost.exe
+*.old.exe
+extension/chromium/
+extension/firefox/
+extension/*.zip
+extension/*.xpi

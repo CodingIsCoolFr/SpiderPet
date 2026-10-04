@@ -1,0 +1,92 @@
+/* What the spider does to the page: the real text changes its look, as in
+   the reference clip. Light pages first, dark pages below. */
+:root {
+  --sp-green: #0E9A4C;
+  --sp-blue: #3346E0;
+  --sp-magenta: #B414C8;
+  --sp-cyan: #0B7FB8;
+  --sp-salmon: #F2836B;
+  --sp-chip: #2F6FE0;
+  --sp-ink: #1E120C;
+  --sp-read: rgba(196, 42, 216, 0.16);
+  --sp-eaten: rgba(196, 42, 216, 0.08);
+}
+:root[data-spiderpet-dark] {
+  --sp-green: #93F5AE;
+  --sp-blue: #7D8BFF;
+  --sp-magenta: #E64CF2;
+  --sp-cyan: #7FD6FF;
+  --sp-chip: #4E8FF0;
+  --sp-read: rgba(230, 76, 242, 0.24);
+  --sp-eaten: rgba(230, 76, 242, 0.1);
+}
+
+.spiderpet-on { transition: color .25s, background-color .25s, letter-spacing .25s; }
+
+.spiderpet-doi {
+  font-family: "Cascadia Mono", Consolas, ui-monospace, monospace !important;
+  color: var(--sp-green) !important;
+  letter-spacing: .02em !important;
+  text-decoration: none !important;
+}
+.spiderpet-isbn {
+  font-family: "Cascadia Mono", Consolas, ui-monospace, monospace !important;
+  color: var(--sp-blue) !important;
+  font-size: 1.22em !important;
+  letter-spacing: .03em !important;
+  text-decoration: none !important;
+}
+.spiderpet-id {
+  font-family: "Cascadia Mono", Consolas, ui-monospace, monospace !important;
+  color: #0D1430 !important;
+  background: var(--sp-chip) !important;
+  border-radius: 3px !important;
+  padding: 0 3px !important;
+  text-decoration: none !important;
+}
+.spiderpet-title {
+  font-family: Georgia, "Times New Roman", serif !important;
+  font-style: italic !important;
+  color: var(--sp-ink) !important;
+  background: var(--sp-salmon) !important;
+  padding: 0 2px !important;
+  text-decoration: none !important;
+}
+.spiderpet-heading { color: var(--sp-magenta) !important; }
+.spiderpet-link {
+  outline: 1.5px solid var(--sp-blue) !important;
+  outline-offset: 1px !important;
+  border-radius: 2px !important;
+}
+
+::highlight(spiderpet-eaten) { background-color: var(--sp-eaten); }
+::highlight(spiderpet-reading) { background-color: var(--sp-read); }
+
+/* The glitch when the spider bites. */
+.spiderpet-glitch { animation: spiderpet-glitch .5s steps(2, end) 1; }
+@keyframes spiderpet-glitch {
+  0% { text-shadow: -3px 0 rgba(0, 240, 255, .7), 3px 0 rgba(255, 42, 109, .7); transform: translateX(-1px); }
+  25% { text-shadow: 4px 0 rgba(0, 240, 255, .6), -4px 0 rgba(255, 42, 109, .6); transform: translateX(2px); }
+  50% { text-shadow: -2px 0 rgba(0, 240, 255, .5), 2px 0 rgba(255, 42, 109, .5); transform: translateX(-1px); }
+  100% { text-shadow: none; transform: none; }
+}
+
+/* The check from the SpiderPet app, right after the find. */
+.spiderpet-badge {
+  all: initial;
+  display: inline-block !important;
+  margin: 0 0 0 5px !important;
+  padding: 0 6px !important;
+  border-radius: 9px !important;
+  font: 600 11px/17px "Segoe UI", system-ui, sans-serif !important;
+  vertical-align: 1px !important;
+  white-space: nowrap !important;
+  cursor: help !important;
+  user-select: none !important;
+}
+.spiderpet-badge[data-tone="ok"] { background: #2E7D4F !important; color: #E9FFF0 !important; cursor: pointer !important; }
+.spiderpet-badge[data-tone="bad"] { background: #B23A3A !important; color: #FFF1F1 !important; cursor: pointer !important; }
+.spiderpet-badge[data-tone="meh"] { background: #5A5F74 !important; color: #EEF0F7 !important; }
+.spiderpet-badge[data-tone="tag"] { background: #6A3C8C !important; color: #F4E9FF !important; }
+.spiderpet-badge[data-tone="wait"] { background: #24426E !important; color: #DCEBFF !important; animation: spiderpet-wait 1.2s ease-in-out infinite; }
+@keyframes spiderpet-wait { 50% { opacity: .55; } }
