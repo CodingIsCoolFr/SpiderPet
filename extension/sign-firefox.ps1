@@ -42,10 +42,16 @@ function Jwt {
 }
 function Call($method, $url, $data) {
   $h = @{ Authorization = "JWT $(Jwt)" }
-  if ($null -ne $data) {
-    $json = $data | ConvertTo-Json -Depth 8 -Compress
-    Invoke-RestMethod -Method $method -Uri $url -Headers $h -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($json))
-  } else { Invoke-RestMethod -Method $method -Uri $url -Headers $h }
+  try {
+    if ($null -ne $data) {
+      $json = $data | ConvertTo-Json -Depth 8 -Compress
+      Invoke-RestMethod -Method $method -Uri $url -Headers $h -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($json))
+    } else { Invoke-RestMethod -Method $method -Uri $url -Headers $h }
+  } catch {
+    # Mozilla says what is wrong in the reply; show that, not just "400 Bad Request".
+    $why = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+    throw "$method $url failed: $why"
+  }
 }
 
 $api = "https://addons.mozilla.org/api/v5/addons"
@@ -115,7 +121,10 @@ $exists = $true
 try { Call Get "$api/addon/$g/" | Out-Null } catch { $exists = $false }
 if ($exists) {
   if (-not $Private) { Call Patch "$api/addon/$g/" $listing | Out-Null }
-  Call Post "$api/addon/$g/versions/" @{ upload = $upload.uuid; license = "MIT" } | Out-Null
+  # Run twice (say, after a hiccup further down): Mozilla already has this version.
+  $have = (Call Get "$api/addon/$g/versions/?filter=all_with_unlisted").results | Where-Object { $_.version -eq $version }
+  if ($have) { Write-Host "Mozilla already has version $version; checking on it." }
+  else { Call Post "$api/addon/$g/versions/" @{ upload = $upload.uuid; license = "MIT" } | Out-Null }
 } else {
   $body = if ($Private) { @{} } else { $listing.Clone() }
   $body.version = @{ upload = $upload.uuid; license = "MIT" }
