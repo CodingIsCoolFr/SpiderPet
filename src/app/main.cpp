@@ -47,7 +47,7 @@ namespace {
 constexpr UINT kTrayMsg = WM_APP + 1;
 constexpr UINT kShowMsg = WM_APP + 2;
 constexpr UINT kWakeMsg = WM_APP + 3;
-constexpr const char* kVersion = "3.5.0";
+constexpr const char* kVersion = "3.6.0";
 
 ImVec4 hexv(uint32_t c, float a = 1.f) {
   return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
@@ -62,6 +62,26 @@ uint32_t kind_color(const std::string& k) {
   return it == m.end() ? 0xC8CCD8 : it->second;
 }
 
+// Text that wraps at the window's edge instead of running off it.
+void wrapped(uint32_t color, const std::string& s) {
+  ImGui::PushStyleColor(ImGuiCol_Text, hexv(color));
+  ImGui::TextWrapped("%s", s.c_str());
+  ImGui::PopStyleColor();
+}
+
+void wrapped_dim(const std::string& s) {
+  ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+  ImGui::TextWrapped("%s", s.c_str());
+  ImGui::PopStyleColor();
+}
+
+// A bullet point whose long lines wrap under its first word.
+void bullet_wrapped(const std::string& s) {
+  ImGui::Bullet();
+  ImGui::SameLine();
+  ImGui::TextWrapped("%s", s.c_str());
+}
+
 struct Pill {
   const char* text;
   uint32_t bg;
@@ -73,7 +93,7 @@ Pill pill_for(const json& v) {
   if (st == "verified") return {"VERIFIED", 0x2E7D4F, 0xE9FFF0};
   if (st == "mismatch") return {"WRONG", 0xB4561E, 0xFFF3E8};
   if (st == "not_found") return {"NOT FOUND", 0xA8323A, 0xFFECEC};
-  if (st == "unverified") return {"UNCLEAR", 0x3A3E52, 0xD6D9E6};
+  if (st == "unverified") return {"NO PROOF FOUND", 0x3A3E52, 0xD6D9E6};
   if (st == "opinion") return {"OPINION", 0x6A3C8C, 0xF4E9FF};
   if (st == "promo") return {"AD", 0x6A3C8C, 0xF4E9FF};
   if (st == "queued" || st == "checking") return {"CHECKING", 0x24426E, 0xDCEBFF};
@@ -442,14 +462,25 @@ std::string step_text(const json& s) {
 bool is_agent_task(const std::string& typed) {
   std::string g = ascii_lower(trim_cmd(typed));
   bool polite = false;
-  for (const char* p : {"please ", "can you ", "could you ", "would you ", "will you ", "spider, ", "spider ", "task: ", "do: "})
+  for (const char* p : {"please ", "can you ", "could you ", "would you ", "will you ", "spider, ", "hey spider ", "task: ", "do: ",
+                        "find me ", "get me ", "show me ", "look up ", "i want ", "i need ", "i'd like ", "help me ",
+                        "go find ", "go get ", "buy me ", "order me "})
     if (g.rfind(p, 0) == 0) {
       g = g.substr(strlen(p));
       polite = true;
     }
   const std::vector<std::string> w = words_in(g);
-  if (w.size() < 2) return false;
+  if (w.empty() || (w.size() < 2 && !polite)) return false;
   if (polite) return true;
+  // A place to do it: "spider plushies on amazon", "cat videos on youtube", "... on example.com".
+  static const std::set<std::string> sites = {
+      "amazon", "youtube", "google", "reddit", "ebay", "wikipedia", "github", "twitter", "netflix", "spotify",
+      "pinterest", "etsy", "walmart", "steam", "twitch", "tiktok", "instagram", "facebook", "imdb", "bing",
+      "duckduckgo", "maps", "gmail", "soundcloud", "discord", "roblox", "aliexpress", "bestbuy", "craigslist"};
+  for (size_t i = 0; i + 1 < w.size(); ++i)
+    if ((w[i] == "on" || w[i] == "at" || w[i] == "from" || w[i] == "in" || w[i] == "using") &&
+        (sites.count(w[i + 1]) || !as_url(w[i + 1]).empty()))
+      return w.size() >= 3;
   // Two things to do: "find a cat video and play it", "go to youtube and search cats".
   static const std::set<std::string> verbs = {
       "play", "watch", "listen", "buy", "order", "book", "subscribe", "unsubscribe", "download", "reply", "comment",
@@ -464,12 +495,27 @@ bool is_agent_task(const std::string& typed) {
   if (v == "show" && w[1] == "me") return w.size() >= 3;
   if (v == "search") return w.size() >= 3 && w[1] != "for" && w[1] != "and";
   if (v == "take" && w[1] == "me") return true;
+  // "find spider eyes" is words to hunt; "find the cheapest plush toy" is a task.
+  if (v == "find" || v == "look")
+    return w.size() >= 4 || (w.size() >= 2 && (w[1] == "the" || w[1] == "a" || w[1] == "an" || w[1] == "out" || w[1] == "some"));
+  // Anything that starts by saying what to do is a task, on any page.
   static const std::set<std::string> starts = {
       "play", "watch", "listen", "buy", "order", "book", "subscribe", "unsubscribe", "download", "reply", "comment",
       "post", "send", "share", "like", "follow", "unfollow", "star", "apply", "register", "join", "login", "create",
       "start", "save", "bookmark", "complete", "finish", "add", "remove", "delete", "cancel", "accept", "decline",
-      "compare", "help", "fill", "upvote", "downvote"};
-  return starts.count(v) && w.size() >= 3;
+      "compare", "help", "fill", "upvote", "downvote", "open", "close", "go", "click", "press", "tap", "type", "write",
+      "enter", "visit", "navigate", "scroll", "change", "edit", "set", "turn", "switch", "enable", "disable", "make",
+      "show", "take", "get", "check", "sort", "filter", "select", "choose", "pick", "stop", "pause", "mute", "unmute",
+      "skip", "translate", "copy", "upload", "rate", "review", "report", "block", "unblock", "hide", "expand",
+      "collapse", "zoom", "print", "reload", "refresh", "use", "try", "put", "move", "drag", "rename", "update",
+      "install", "uninstall", "message", "dm", "email", "call", "text", "invite", "accept", "fix", "clear", "empty",
+      "reserve", "schedule", "track", "pay", "donate", "vote", "answer", "ask", "contact", "sign", "log"};
+  // Two words are a task only when the first can't start a thing's name ("open settings", not "report card").
+  static const std::set<std::string> short_ok = {
+      "open", "close", "click", "press", "tap", "scroll", "mute", "unmute", "pause", "subscribe", "unsubscribe",
+      "download", "translate", "refresh", "reload", "login", "bookmark", "follow", "unfollow", "upvote", "downvote",
+      "like", "play", "zoom", "expand", "collapse", "sign", "log", "go", "visit", "navigate", "install", "uninstall"};
+  return starts.count(v) > 0 && (w.size() >= 3 || (w.size() == 2 && short_ok.count(v) > 0));
 }
 
 std::wstring exe_dir() {
@@ -1248,7 +1294,15 @@ void App::worker() {
       // The first time: what the goal really asks for ("play me a cat video" is a video about cats, playing).
       json intent = job.data["intent"];
       if (!intent.is_object()) {
-        intent = checker_.understand(jstr(job.data, "goal"), think);
+        // The plan is made looking at the page you are on, so it uses that page's own buttons.
+        const json& snap = job.data["snap"];
+        std::string page = "Page: " + jstr(snap, "title") + "\nAddress: " + jstr(snap, "url") + "\nOn the page:";
+        if (snap.contains("items") && snap["items"].is_array())
+          for (const json& it : snap["items"]) {
+            if (page.size() > 3800) break;
+            page += "\n- " + jstr(it, "kind") + ": " + jstr(it, "label");
+          }
+        intent = checker_.understand(jstr(job.data, "goal"), page, think);
         std::lock_guard lock(mu_);
         if (job.data.value("seq", -1) == task_.seq && intent.is_object()) {
           task_.intent = intent;
@@ -1302,10 +1356,16 @@ void App::commit_goal(const std::string& goal, bool force) {
     else start_task(goal, steps);
     return;
   }
-  if (is_agent_task(goal)) {
+  {
+    // On a browser page (a new tab, settings) there is nothing to hunt through:
+    // whatever you type there is something to go and do.
     std::lock_guard lock(mu_);
-    start_agent(goal);
-    return;
+    const Browser* b = current();
+    const bool on_web = b && b->web;
+    if (is_agent_task(goal) || (b && !on_web && !goal.empty() && ask_kind(goal) != Ask::About)) {
+      start_agent(goal);
+      return;
+    }
   }
   int client = -1;
   json terms;
@@ -1525,7 +1585,7 @@ void App::draw_task() {
   ImGui::PushStyleColor(ImGuiCol_ChildBg, hexv(ready && task_.warn ? 0x3A1A22 : 0x15233A));
   ImGui::BeginChild("##task", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
   ImGui::PushFont(small_, small_->LegacySize);
-  ImGui::TextColored(hexv(0x7FD6FF), "%s", task_.command.c_str());
+  wrapped(0x7FD6FF, task_.command);
   if (task_.agent && task_.state != Task::Done && task_.state != Task::Failed) {
     ImGui::SameLine();
     ImGui::TextDisabled("   step %d", task_.actions + 1);
@@ -1535,7 +1595,7 @@ void App::draw_task() {
   }
   for (size_t i = task_.log.size() > 6 ? task_.log.size() - 6 : 0; i < task_.log.size(); ++i) {
     const auto& [text, ok] = task_.log[i];
-    ImGui::TextColored(hexv(ok ? 0x8BF5A6 : 0xFF8A6B), "%s %s", ok ? "done:" : "not done:", text.c_str());
+    wrapped(ok ? 0x8BF5A6 : 0xFF8A6B, std::string(ok ? "done: " : "not done: ") + text);
   }
   ImGui::PopFont();
 
@@ -1557,7 +1617,7 @@ void App::draw_task() {
   }
   if (task_.agent && !task_.say.empty() && task_.state != Task::Done && task_.state != Task::Failed && task_.state != Task::NeedsYou) {
     ImGui::PushFont(small_, small_->LegacySize);
-    ImGui::TextColored(hexv(0xB9C0D8), "%s", task_.say.c_str());
+    wrapped(0xB9C0D8, task_.say);
     ImGui::PopFont();
   }
   switch (task_.state) {
@@ -1571,7 +1631,7 @@ void App::draw_task() {
       }
       [[fallthrough]];
     case Task::Finding:
-      ImGui::TextDisabled("%s: the spider is looking for it...", step_text(task_.steps[task_.at]).c_str());
+      wrapped_dim(step_text(task_.steps[task_.at]) + ": the spider is looking for it...");
       if (ImGui::SmallButton(task_.agent ? "Stop" : "Cancel")) closed = true;
       break;
     case Task::Ready:
@@ -1582,7 +1642,7 @@ void App::draw_task() {
       }
       ImGui::TextWrapped("%s?", task_.desc.c_str());
       if (task_.warn)
-        ImGui::TextColored(hexv(0xFF8A6B), "Careful: this may spend money, send something, or can't be undone. Look at the page first.");
+        wrapped(0xFF8A6B, "Careful: this may spend money, send something, or can't be undone. Look at the page first.");
       ImGui::PushStyleColor(ImGuiCol_Button, hexv(0x2E7D4F));
       ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hexv(0x379660));
       if (ImGui::Button("Do it")) {
@@ -1602,7 +1662,7 @@ void App::draw_task() {
       break;
     case Task::Done:
       if (task_.agent && !task_.say.empty()) ImGui::TextWrapped("%s", task_.say.c_str());
-      if (!task_.hint.empty()) ImGui::TextColored(hexv(0xFFC46B), "%s", task_.hint.c_str());
+      if (!task_.hint.empty()) wrapped(0xFFC46B, task_.hint);
       ImGui::TextColored(hexv(0x8BF5A6), "Done.");
       ImGui::SameLine();
       if (ImGui::SmallButton("Close")) closed = true;
@@ -2075,7 +2135,7 @@ void App::draw_header() {
   dot(settings_.online);
   ImGui::TextUnformatted(settings_.online ? "online checks on" : "online checks off");
   if (checker_.gpu_busy())
-    ImGui::TextColored(hexv(0xFFC46B), "AI paused: another app is using the graphics card memory. Ids are still checked.");
+    wrapped(0xFFC46B, "AI paused: another app is using the graphics card memory. Ids are still checked.");
   const size_t waiting = queued_.size();
   if (!busy_.empty() || waiting) {
     ImGui::TextDisabled("%s%s", busy_.empty() ? "" : busy_.c_str(),
@@ -2127,7 +2187,7 @@ void App::draw_header() {
     ImGui::TextDisabled("%s tab: %s%s", cur->name.c_str(), cur->title.substr(0, 80).c_str(),
                         on ? (terms_.empty() ? "   (spider on)" : "   (spider hunting)") : "");
   ImGui::PopFont();
-  if (!notice_.empty() && now_seconds() - notice_at_ < 6) ImGui::TextColored(hexv(0xFFC46B), "%s", notice_.c_str());
+  if (!notice_.empty() && now_seconds() - notice_at_ < 6) wrapped(0xFFC46B, notice_);
   draw_task();
   ImGui::Spacing();
 }
@@ -2235,7 +2295,9 @@ void App::draw_page() {
   ImGui::TextWrapped("%s", jstr(*p, "title").c_str());
   ImGui::PopFont();
   ImGui::PushFont(small_, small_->LegacySize);
-  ImGui::TextColored(hexv(0x7D8BFF), "%s", active_url_.substr(0, 90).c_str());
+  // Short enough that the Forget button next to it stays in the window.
+  ImGui::TextColored(hexv(0x7D8BFF), "%s", active_url_.size() > 64 ? (active_url_.substr(0, 63) + "...").c_str() : active_url_.c_str());
+  if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", active_url_.c_str());
   if (ImGui::IsItemClicked()) open_url(active_url_);
   ImGui::SameLine();
   if (confirm("Forget this page", "Click again: forget it", "page:" + active_url_)) {
@@ -2250,14 +2312,14 @@ void App::draw_page() {
     ImGui::PushStyleColor(ImGuiCol_ChildBg, hexv(0x1D1630));
     ImGui::BeginChild("##answer", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(small_, small_->LegacySize);
-    ImGui::TextColored(hexv(0xE64CF2), "%s", reply_.goal.c_str());
+    wrapped(0xE64CF2, reply_.goal);
     ImGui::PopFont();
     if (reply_.busy) {
       ImGui::TextDisabled("Reading the page...");
     } else {
       ImGui::TextWrapped("%s", reply_.text.c_str());
       ImGui::PushFont(small_, small_->LegacySize);
-      if (!reply_.quote.empty()) ImGui::TextColored(hexv(0xB9C0D8), "from the page: \"%s\"", reply_.quote.c_str());
+      if (!reply_.quote.empty()) wrapped(0xB9C0D8, "from the page: \"" + reply_.quote + "\"");
       ImGui::TextDisabled(reply_.by_ai ? "answered by your local AI, from this page only"
                                        : "a quick answer from the page's own sentences (the AI is paused or off)");
       ImGui::PopFont();
@@ -2275,7 +2337,7 @@ void App::draw_page() {
     ImGui::TextWrapped("%s", jstr(g, "summary").c_str());
     if (g.contains("points") && g["points"].is_array())
       for (const json& pt : g["points"])
-        if (pt.is_string()) ImGui::BulletText("%s", pt.get<std::string>().c_str());
+        if (pt.is_string()) bullet_wrapped(pt.get<std::string>());
     ImGui::EndChild();
   }
   ImGui::Spacing();
@@ -2313,7 +2375,7 @@ void App::draw_library() {
   ImGui::InputTextWithHint("##search", "Search the library", search_, sizeof(search_));
   ImGui::SameLine();
   ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.45f);
-  const char* filters[] = {"All", "Verified", "Problems", "Unclear", "Not checked"};
+  const char* filters[] = {"All", "Verified", "Problems", "No proof found", "Not checked"};
   ImGui::Combo("##status", &status_filter_, filters, 5);
   ImGui::SameLine();
   ImGui::AlignTextToFramePadding();

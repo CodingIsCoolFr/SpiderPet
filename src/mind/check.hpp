@@ -59,7 +59,8 @@ class Checker {
                              const nlohmann::json& history, const nlohmann::json& snap, bool think = false);
   // What a goal really asks for, before the first step: {intent, done_when,
   // query, media}. Null without the model.
-  nlohmann::json understand(const std::string& goal, bool think = false);
+  // page: what the person has open right now (title, address, what can be clicked), so the plan uses it.
+  nlohmann::json understand(const std::string& goal, const std::string& page, bool think = false);
   // One sentence, up to three key points, and what kind of page it is.
   nlohmann::json gist(const std::string& title, const std::string& url, const std::string& text);
   // True for a while after the model got squeezed out of the graphics card

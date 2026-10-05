@@ -1073,7 +1073,7 @@
     verified: ['✓ verified', 'ok'],
     mismatch: ['⚠ wrong', 'bad'],
     not_found: ['✗ not found', 'bad'],
-    unverified: ['? unclear', 'meh'],
+    unverified: ['? no proof found', 'meh'],
     opinion: ['opinion', 'tag'],
     promo: ['ad', 'tag'],
     queued: ['checking…', 'wait'],
