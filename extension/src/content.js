@@ -1954,6 +1954,21 @@
 
   // What the page offers right now, for the AI that plans a task: some of its
   // text and a numbered list of what can be clicked or typed into.
+  // A button that only says "Add to cart" or "More" means nothing on its own:
+  // the words of the row or card it sits in say what it is for.
+  function rowTextOf(el, label) {
+    let up = el.parentElement;
+    for (let i = 0; up && up !== document.body && i < 6; i++, up = up.parentElement) {
+      const t = squash(up.innerText || '');
+      if (t.length > label.length + 8) {
+        if (t.length > 220) return '';  // a whole section, not its row: too much to help
+        const rest = squash(t.replace(label, ' '));
+        return rest.length > 140 ? rest.slice(0, 139) + '…' : rest;
+      }
+    }
+    return '';
+  }
+
   let snapEls = [];
   let lastSnap = { url: '', els: new WeakSet() };
   function snapshot() {
@@ -1962,6 +1977,9 @@
     // On screen first, then the rest in reading order; only things with a name.
     all.sort((a, b) => (b.inView - a.inView) || a.order - b.order);
     snapEls = all.filter((c) => c.label || c.kind === 'field' || c.kind === 'list').filter((c) => !secret(c.el)).slice(0, 90);
+    // Labels used more than once, and short ones, get the words around them.
+    const count = new Map();
+    for (const c of snapEls) count.set(words(c.label), (count.get(words(c.label)) || 0) + 1);
     const sameUrl = lastSnap.url === pageUrl();
     const before = lastSnap.els;
     lastSnap = { url: pageUrl(), els: new WeakSet(snapEls.map((c) => c.el)) };
@@ -1994,6 +2012,7 @@
         inView: c.inView,
         search: c.kind === 'field' && searchBox(c.el),
         fresh: sameUrl && !before.has(c.el),
+        near: c.kind !== 'field' && (count.get(words(c.label)) > 1 || c.label.length < 12) ? rowTextOf(c.el, c.label) : '',
         covered: c.inView && covered(c.el),
       })),
     };

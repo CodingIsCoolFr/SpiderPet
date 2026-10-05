@@ -54,11 +54,12 @@ class Checker {
   // scroll, items: [{i, kind, label, href, value, inView, search}]}) and what was
   // done so far. -> {action: click|type|scroll|goto|back|done|ask, index, text,
   // enter, url, dir, say}. Null without the model.
+  // think: the model reasons before each step (smarter, about 3x slower).
   nlohmann::json next_action(const std::string& goal, const nlohmann::json& intent, const std::string& memory,
-                             const nlohmann::json& history, const nlohmann::json& snap);
+                             const nlohmann::json& history, const nlohmann::json& snap, bool think = false);
   // What a goal really asks for, before the first step: {intent, done_when,
   // query, media}. Null without the model.
-  nlohmann::json understand(const std::string& goal);
+  nlohmann::json understand(const std::string& goal, bool think = false);
   // One sentence, up to three key points, and what kind of page it is.
   nlohmann::json gist(const std::string& title, const std::string& url, const std::string& text);
   // True for a while after the model got squeezed out of the graphics card
@@ -76,8 +77,9 @@ class Checker {
   nlohmann::json check_claim(const std::string& sentence, const nlohmann::json& page, bool online);
   nlohmann::json compare_record(const std::string& context, const std::string& found_title, nlohmann::json out);
   // Ask the local model for JSON that fits `schema`. Null when it cannot.
+  // think: let a thinking model (Qwen3) reason before it answers: smarter, slower.
   nlohmann::json ask(const std::string& system, const std::string& user, const nlohmann::json& schema,
-                     int max_tokens = 300);
+                     int max_tokens = 300, bool think = false);
   std::string pick_model();
   bool fits(const std::string& model);
   void load_cache();

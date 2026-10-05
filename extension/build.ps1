@@ -5,6 +5,13 @@
 #   extension\spiderpet-chromium.zip           for the release page
 $ErrorActionPreference = "Stop"
 $here = $PSScriptRoot
+# Two top-level functions with one name: JavaScript quietly keeps the second,
+# and every caller of the first breaks (it once stopped the spider reading pages).
+foreach ($js in Get-ChildItem (Join-Path $here "src\*.js")) {
+  $dupes = Select-String -Path $js.FullName -Pattern '^  function (\w+)\(' | ForEach-Object { $_.Matches[0].Groups[1].Value } |
+    Group-Object | Where-Object Count -gt 1 | ForEach-Object Name
+  if ($dupes) { throw "$($js.Name): more than one function named $($dupes -join ', ')" }
+}
 foreach ($target in "chromium", "firefox") {
   $out = Join-Path $here $target
   if (Test-Path $out) { Remove-Item $out -Recurse -Force }

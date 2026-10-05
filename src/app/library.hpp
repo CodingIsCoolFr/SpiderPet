@@ -15,6 +15,7 @@ struct Settings {
   bool crawl = true;           // work through the whole page, out of sight too (it never scrolls)
   bool popups = true;          // tuck away popups, cookie banners and sign-up walls that block the page
   bool ask_every_step = false; // tasks: wait for "Do it" on every step, not only the risky ones
+  bool think_tasks = true;     // tasks: the AI thinks before each step (smarter, slower)
   std::string model;           // empty = best installed
 
   nlohmann::json to_json() const;

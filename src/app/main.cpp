@@ -47,7 +47,7 @@ namespace {
 constexpr UINT kTrayMsg = WM_APP + 1;
 constexpr UINT kShowMsg = WM_APP + 2;
 constexpr UINT kWakeMsg = WM_APP + 3;
-constexpr const char* kVersion = "3.4.0";
+constexpr const char* kVersion = "3.5.0";
 
 ImVec4 hexv(uint32_t c, float a = 1.f) {
   return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
@@ -612,7 +612,8 @@ class App {
     int actions = 0, fails = 0;        // a goal: steps taken, failures in a row
     std::vector<std::string> history;  // a goal: what was done, for the AI
     std::string say;                   // a goal: the AI's last words (its plan, or the result)
-    json intent;                       // a goal: what it really asks for, worked out once at the start
+    json intent;                       // a goal: what it really asks for and its plan, worked out at the start
+    int plan_step = 0;                 // a goal: the plan step it is on (1-based), 0 before there is a plan
     std::string memory;                // a goal: the AI's own notes, carried from step to step
     int false_done = 0;                // a goal: times the AI said done but the page said otherwise
     std::string hint;                  // a goal: something to tell you at the end (it plays without sound)
@@ -1237,18 +1238,27 @@ void App::worker() {
         busy_ = "planning the next step";
       }
       wake();
+      bool think;
+      {
+        std::lock_guard lock(mu_);
+        think = settings_.think_tasks;
+        if (think) busy_ = "thinking about the next step";
+      }
+      wake();
       // The first time: what the goal really asks for ("play me a cat video" is a video about cats, playing).
       json intent = job.data["intent"];
       if (!intent.is_object()) {
-        intent = checker_.understand(jstr(job.data, "goal"));
+        intent = checker_.understand(jstr(job.data, "goal"), think);
         std::lock_guard lock(mu_);
         if (job.data.value("seq", -1) == task_.seq && intent.is_object()) {
           task_.intent = intent;
+          task_.plan_step = 1;
           task_.say = "Goal: " + jstr(intent, "intent");
         }
       }
       wake();
-      const json a = checker_.next_action(jstr(job.data, "goal"), intent, jstr(job.data, "memory"), job.data["history"], job.data["snap"]);
+      const json a = checker_.next_action(jstr(job.data, "goal"), intent, jstr(job.data, "memory"), job.data["history"],
+                                          job.data["snap"], think);
       std::lock_guard lock(mu_);
       busy_.clear();
       if (job.data.value("seq", -1) == task_.seq && task_.state == Task::Thinking) agent_step(a, job.data["snap"]);
@@ -1530,6 +1540,21 @@ void App::draw_task() {
   ImGui::PopFont();
 
   bool closed = false;
+  if (task_.agent && task_.intent.is_object() && task_.intent.contains("plan") && task_.intent["plan"].is_array() &&
+      task_.state != Task::Done && task_.state != Task::Failed) {
+    // The plan: what it means to do, with the step it is on marked.
+    ImGui::PushFont(small_, small_->LegacySize);
+    int k = 0;
+    for (const json& p : task_.intent["plan"]) {
+      if (!p.is_string()) continue;
+      ++k;
+      const bool now = k == task_.plan_step, past = k < task_.plan_step;
+      ImGui::PushStyleColor(ImGuiCol_Text, hexv(now ? 0xE64CF2 : past ? 0x6E7488 : 0xB9C0D8));
+      ImGui::TextWrapped("%s %d. %s", now ? ">" : " ", k, p.get<std::string>().c_str());
+      ImGui::PopStyleColor();
+    }
+    ImGui::PopFont();
+  }
   if (task_.agent && !task_.say.empty() && task_.state != Task::Done && task_.state != Task::Failed && task_.state != Task::NeedsYou) {
     ImGui::PushFont(small_, small_->LegacySize);
     ImGui::TextColored(hexv(0xB9C0D8), "%s", task_.say.c_str());
@@ -1644,6 +1669,16 @@ void App::agent_step(const json& a, const json& snap) {
   const std::string act = jstr(a, "action");
   task_.say = jstr(a, "say");
   if (!jstr(a, "memory").empty()) task_.memory = jstr(a, "memory");
+  // It follows its plan, and writes a new one when the old one hit a dead end.
+  if (task_.intent.is_object()) {
+    if (a.contains("new_plan") && a["new_plan"].is_array() && a["new_plan"].size() >= 2) {
+      task_.intent["plan"] = a["new_plan"];
+      task_.plan_step = 1;
+      task_.history.push_back("you made a new plan");
+    } else if (a.value("plan_step", 0) >= 1) {
+      task_.plan_step = a.value("plan_step", 0);
+    }
+  }
   if (act == "done") {
     // A video or song has to really play: the page says whether it does, not the AI.
     bool playing = false, has_media = false;
@@ -2345,6 +2380,13 @@ void App::draw_settings() {
   ImGui::Indent();
   ImGui::TextWrapped("The spider hides them; it never clicks Accept or anything else. Unclear ones go to the local AI. "
                      "Stop the spider and they come back.");
+  ImGui::Unindent();
+  ImGui::PopFont();
+  changed |= ImGui::Checkbox("Tasks: let the AI think before each step (smarter, slower)", &s.think_tasks);
+  ImGui::PushFont(small_, small_->LegacySize);
+  ImGui::Indent();
+  ImGui::TextWrapped("Thinking picks the right result instead of the first one that has your words. A step takes about "
+                     "10 to 30 seconds instead of 3 to 5. Works with Qwen3 models.");
   ImGui::Unindent();
   ImGui::PopFont();
   changed |= ImGui::Checkbox("Tasks: ask me before every step", &s.ask_every_step);
