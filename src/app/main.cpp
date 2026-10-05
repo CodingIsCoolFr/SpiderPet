@@ -429,6 +429,7 @@ std::string step_text(const json& s) {
   if (v == "back") return "Go back";
   if (v == "forward") return "Go forward";
   if (v == "reload") return "Reload the page";
+  if (v == "media") return jstr(s, "op") == "pause" ? "Pause the video" : "Play the video";
   if (v == "goto") return "Open " + jstr(s, "url");
   if (v == "type")
     return "Type \"" + jstr(s, "text") + "\" into " + jstr(s, "what") + (s.value("enter", false) ? " and press Enter" : "");
@@ -546,7 +547,8 @@ class App {
   void task_stop(const std::string& note);  // called with mu_ held
   void task_next(bool ok = true, const std::string& note = "");  // the step is over; called with mu_ held
   void start_agent(const std::string& goal);                    // called with mu_ held
-  void agent_step(const json& action, int seq);                 // the AI's next step; called with mu_ held
+  void agent_step(const json& action, const json& snap);       // the AI's next step; called with mu_ held
+  void needs_you(const std::string& what);                      // a goal waits for you; called with mu_ held
   void draw_task();                         // called with mu_ held
 
   struct Job {
@@ -605,11 +607,15 @@ class App {
   void queue_answer();                     // called with mu_ held
   // A command you typed, step by step.
   struct Task {
-    enum State { Idle, Waiting, Snapping, Thinking, Finding, Ready, Doing, Done, Failed } state = Idle;
+    enum State { Idle, Waiting, Snapping, Thinking, Finding, Ready, Doing, NeedsYou, Done, Failed } state = Idle;
     bool agent = false;                // a goal the AI plans, not a list of steps you gave
     int actions = 0, fails = 0;        // a goal: steps taken, failures in a row
     std::vector<std::string> history;  // a goal: what was done, for the AI
     std::string say;                   // a goal: the AI's last words (its plan, or the result)
+    json intent;                       // a goal: what it really asks for, worked out once at the start
+    std::string memory;                // a goal: the AI's own notes, carried from step to step
+    int false_done = 0;                // a goal: times the AI said done but the page said otherwise
+    std::string hint;                  // a goal: something to tell you at the end (it plays without sound)
     bool auto_go = false;              // a safe step: it goes by itself at auto_at
     double auto_at = 0;
     std::string command;
@@ -636,6 +642,8 @@ class App {
 
   // UI state
   char goal_[512] = {};
+  char answer_[512] = {};  // your reply when a task needs you
+  bool focus_answer_ = false;  // the reply box takes the keyboard when the question comes up
   char search_[256] = {};
   int status_filter_ = 0;
   std::string notice_;
@@ -897,7 +905,7 @@ void App::on_message(int client, const json& raw) {
     task_.since = now_seconds();
     json hist = json::array();
     for (const std::string& h : task_.history) hist.push_back(h);
-    urgent_.push_front({Job::Agent, jstr(snap, "url"), "", {{"seq", task_.seq}, {"goal", task_.command}, {"history", hist}, {"snap", snap}}});
+    urgent_.push_front({Job::Agent, jstr(snap, "url"), "", {{"seq", task_.seq}, {"goal", task_.command}, {"intent", task_.intent}, {"memory", task_.memory}, {"history", hist}, {"snap", snap}}});
     cv_.notify_all();
     wake();
     return;
@@ -1038,16 +1046,26 @@ void App::worker() {
         const json* f = lib_.find(j.id);
         return f && jstr(*f, "kind") == "sentence";
       };
+      // A task you are waiting on goes first: checking and ranking finds wait until it is over.
+      const bool tasking = task_.state != Task::Idle && task_.state != Task::Done && task_.state != Task::Failed &&
+                           task_.state != Task::NeedsYou;
+      auto may_run = [&](const Job& j) {
+        if (tasking && j.type != Job::Agent && j.type != Job::Pick && j.type != Job::Blockers) return false;
+        return !gpu_busy || !needs_model(j);
+      };
       std::deque<Job>* q = nullptr;
       size_t at = 0;
       for (std::deque<Job>* d : {&urgent_, &jobs_}) {
         for (size_t i = 0; i < d->size() && !q; ++i)
-          if (!gpu_busy || !needs_model((*d)[i])) q = d, at = i;
+          if (may_run((*d)[i])) q = d, at = i;
         if (q) break;
       }
       if (!q) {
         wake();
-        cv_.wait_for(lock, std::chrono::seconds(3), [&] { return quit_.load(); });
+        // Wakes at once when a task's step arrives; otherwise looks again in 3 s.
+        cv_.wait_for(lock, std::chrono::seconds(3), [&] {
+          return quit_.load() || (!gpu_busy && std::any_of(urgent_.begin(), urgent_.end(), [](const Job& j) { return j.type == Job::Agent || j.type == Job::Pick; }));
+        });
         continue;
       }
       job = std::move((*q)[at]);
@@ -1219,10 +1237,21 @@ void App::worker() {
         busy_ = "planning the next step";
       }
       wake();
-      const json a = checker_.next_action(jstr(job.data, "goal"), job.data["history"], job.data["snap"]);
+      // The first time: what the goal really asks for ("play me a cat video" is a video about cats, playing).
+      json intent = job.data["intent"];
+      if (!intent.is_object()) {
+        intent = checker_.understand(jstr(job.data, "goal"));
+        std::lock_guard lock(mu_);
+        if (job.data.value("seq", -1) == task_.seq && intent.is_object()) {
+          task_.intent = intent;
+          task_.say = "Goal: " + jstr(intent, "intent");
+        }
+      }
+      wake();
+      const json a = checker_.next_action(jstr(job.data, "goal"), intent, jstr(job.data, "memory"), job.data["history"], job.data["snap"]);
       std::lock_guard lock(mu_);
       busy_.clear();
-      if (job.data.value("seq", -1) == task_.seq && task_.state == Task::Thinking) agent_step(a, task_.seq);
+      if (job.data.value("seq", -1) == task_.seq && task_.state == Task::Thinking) agent_step(a, job.data["snap"]);
       continue;
     } else if (job.type == Job::Pick) {
       {
@@ -1373,13 +1402,14 @@ void App::task_next(bool ok, const std::string& note) {
   task_.auto_go = false;
   if (task_.agent) {
     // A goal goes on after a failed step too: the AI sees what went wrong and tries something else.
+    if (ok && note.find("without sound") != std::string::npos) task_.hint = note;
     task_.log.push_back({what + (ok ? "" : " (" + note + ")"), ok});
     task_.history.push_back(what + (ok ? ": done" : ": failed, " + note));
     task_.desc.clear();
     task_.warn = false;
     task_.fails = ok ? 0 : task_.fails + 1;
-    if (task_.fails >= 3) return task_stop("Stopped: three steps in a row did not work.");
-    if (++task_.actions >= 25) return task_stop("Stopped after 25 steps. Give it a smaller goal, or the next part of it.");
+    if (task_.fails >= 3) return needs_you("Three steps in a row did not work. Tell me what to try, or press Continue to let me try again.");
+    if (++task_.actions % 40 == 0) return needs_you("That was 40 steps. Press Continue to keep going.");
     task_.state = Task::Waiting;
     task_.since = now_seconds() + 1.5;  // a click may have opened a new page: let it load before the next look
     return;
@@ -1472,7 +1502,7 @@ void App::task_tick() {
 void App::draw_task() {
   if (task_.state == Task::Idle) return;
   const double t = now_seconds();
-  if (task_.state == Task::Done && t - task_.since > 15) {
+  if (task_.state == Task::Done && !task_.agent && t - task_.since > 15) {  // a goal's answer stays until you close it
     task_ = Task{};
     return;
   }
@@ -1500,7 +1530,7 @@ void App::draw_task() {
   ImGui::PopFont();
 
   bool closed = false;
-  if (task_.agent && !task_.say.empty() && task_.state != Task::Done && task_.state != Task::Failed) {
+  if (task_.agent && !task_.say.empty() && task_.state != Task::Done && task_.state != Task::Failed && task_.state != Task::NeedsYou) {
     ImGui::PushFont(small_, small_->LegacySize);
     ImGui::TextColored(hexv(0xB9C0D8), "%s", task_.say.c_str());
     ImGui::PopFont();
@@ -1547,12 +1577,42 @@ void App::draw_task() {
       break;
     case Task::Done:
       if (task_.agent && !task_.say.empty()) ImGui::TextWrapped("%s", task_.say.c_str());
+      if (!task_.hint.empty()) ImGui::TextColored(hexv(0xFFC46B), "%s", task_.hint.c_str());
       ImGui::TextColored(hexv(0x8BF5A6), "Done.");
       ImGui::SameLine();
       if (ImGui::SmallButton("Close")) closed = true;
       break;
+    case Task::NeedsYou: {
+      ImGui::PushStyleColor(ImGuiCol_Text, hexv(0xFFC46B));
+      ImGui::TextWrapped("%s", task_.note.c_str());
+      ImGui::PopStyleColor();
+      ImGui::SetNextItemWidth(-1);
+      if (focus_answer_) {
+        ImGui::SetKeyboardFocusHere();
+        focus_answer_ = false;
+      }
+      const bool sent = ImGui::InputTextWithHint("##answer", "Your answer (or leave it empty if you did it on the page)", answer_,
+                                                 sizeof(answer_), ImGuiInputTextFlags_EnterReturnsTrue);
+      if (ImGui::Button("Continue") || sent) {
+        const std::string said = utf8(trim(wide(answer_)));
+        task_.history.push_back(said.empty() ? "you asked the person: \"" + task_.note + "\"; they did it on the page and said continue"
+                                             : "you asked the person: \"" + task_.note + "\"; they answered: " + said);
+        task_.log.push_back({said.empty() ? "you: continue" : "you: " + said, true});
+        answer_[0] = 0;
+        task_.state = Task::Waiting;
+        task_.since = t;
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Stop")) closed = true;
+      ImGui::PushFont(small_, small_->LegacySize);
+      ImGui::TextDisabled("Passwords: type them on the page yourself (or let your browser fill them), then press Continue.");
+      ImGui::PopFont();
+      break;
+    }
     case Task::Failed:
-      ImGui::TextColored(hexv(0xFFC46B), "%s", task_.note.c_str());
+      ImGui::PushStyleColor(ImGuiCol_Text, hexv(0xFFC46B));
+      ImGui::TextWrapped("%s", task_.note.c_str());
+      ImGui::PopStyleColor();
       ImGui::SameLine();
       if (ImGui::SmallButton("Close")) closed = true;
       break;
@@ -1564,18 +1624,45 @@ void App::draw_task() {
   if (closed) cancel();
 }
 
+// The goal waits for you: a password to type, a choice to make, a question.
+// You answer in the box (or just do it on the page) and press Continue.
+void App::needs_you(const std::string& what) {
+  task_.state = Task::NeedsYou;
+  task_.note = what;
+  task_.since = now_seconds();
+  task_.fails = 0;
+  answer_[0] = 0;
+  focus_answer_ = true;
+  if (hwnd_) PostMessageW(hwnd_, kShowMsg, 0, 0);  // the window comes up so you see the question
+  wake();
+}
+
 // What the AI chose. A click or typing goes to the spider by the thing's
 // number from the last look; the spider holds it, and risky steps wait for you.
-void App::agent_step(const json& a, int seq) {
+void App::agent_step(const json& a, const json& snap) {
   if (!a.is_object()) return task_stop("The local AI is not answering (it is off, or paused because a game is using the graphics card).");
   const std::string act = jstr(a, "action");
   task_.say = jstr(a, "say");
+  if (!jstr(a, "memory").empty()) task_.memory = jstr(a, "memory");
   if (act == "done") {
+    // A video or song has to really play: the page says whether it does, not the AI.
+    bool playing = false, has_media = false;
+    if (snap.contains("media") && snap["media"].is_array())
+      for (const json& m : snap["media"]) has_media = true, playing = playing || m.value("playing", false);
+    if (task_.intent.is_object() && task_.intent.value("media", false) && !playing) {
+      if (++task_.false_done >= 3)
+        return task_stop("I could not get it to play. Press play on the page once; if your browser blocks sound, allow autoplay for this site.");
+      task_.history.push_back(std::string("said done, but ") +
+                              (has_media ? "the video on the page is NOT playing (paused): use play" : "nothing is playing on this page yet"));
+      task_.state = Task::Waiting;
+      task_.since = now_seconds() + 0.5;
+      return;
+    }
     task_.state = Task::Done;
     task_.since = now_seconds() + 45;  // stays up longer: it may hold an answer
     return;
   }
-  if (act == "ask") return task_stop("The spider needs you: " + (task_.say.empty() ? std::string("it is stuck.") : task_.say));
+  if (act == "ask") return needs_you(task_.say.empty() ? std::string("I am stuck. What should I do?") : task_.say);
   json step;
   const int index = a.value("index", -1);
   if (act == "click" || act == "type") {
@@ -1594,10 +1681,13 @@ void App::agent_step(const json& a, int seq) {
     step = {{"verb", "goto"}, {"url", url}};
   } else if (act == "back") {
     step = {{"verb", "back"}};
+  } else if (act == "key") {
+    step = {{"verb", "key"}, {"key", jstr(a, "text")}};
+  } else if (act == "play" || act == "pause") {
+    step = {{"verb", "media"}, {"op", act}};
   } else {
     return task_stop("The AI's answer made no sense. Try saying it another way.");
   }
-  (void)seq;
   task_.steps = json::array({step});
   task_.at = 0;
   task_.desc.clear();

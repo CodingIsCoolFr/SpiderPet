@@ -54,7 +54,11 @@ class Checker {
   // scroll, items: [{i, kind, label, href, value, inView, search}]}) and what was
   // done so far. -> {action: click|type|scroll|goto|back|done|ask, index, text,
   // enter, url, dir, say}. Null without the model.
-  nlohmann::json next_action(const std::string& goal, const nlohmann::json& history, const nlohmann::json& snap);
+  nlohmann::json next_action(const std::string& goal, const nlohmann::json& intent, const std::string& memory,
+                             const nlohmann::json& history, const nlohmann::json& snap);
+  // What a goal really asks for, before the first step: {intent, done_when,
+  // query, media}. Null without the model.
+  nlohmann::json understand(const std::string& goal);
   // One sentence, up to three key points, and what kind of page it is.
   nlohmann::json gist(const std::string& title, const std::string& url, const std::string& text);
   // True for a while after the model got squeezed out of the graphics card

@@ -1744,11 +1744,11 @@
     '[role=switch], [role=combobox], [role=searchbox], [role=textbox], [contenteditable=""], [contenteditable=true], [onclick]';
   const FIELD =
     'input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]):not([type=checkbox]):not([type=radio]):not([type=image]), ' +
-    'textarea, [role=searchbox], [role=textbox], [role=combobox], [contenteditable=""], [contenteditable=true]';
+    'textarea, select, [role=searchbox], [role=textbox], [role=combobox], [contenteditable=""], [contenteditable=true]';
   // Words that say the click may cost money, send something, or can't be undone.
   // "Post" only as the button's first word: "Like this post" is harmless.
   const RISKY =
-    /\b(buy|pay|purchase|order|checkout|check out|subscribe|unsubscribe|delete|remove|send|publish|submit|confirm|transfer|donate|sign up|register|log ?out|sign out)\b|^(post|reply|tweet|share)\b/i;
+    /\b(buy|pay|purchase|order|checkout|check out|subscribe|unsubscribe|delete|remove|send|publish|submit|confirm|transfer|donate|sign up|register|log ?out|sign out|commit|merge|save changes|deactivate|close account)\b|^(post|reply|tweet|share|save|update|apply)\b/i;
 
   // Passwords, card numbers and one-time codes: the spider never types there.
   function secret(el) {
@@ -1763,8 +1763,8 @@
     const type = (el.getAttribute('type') || '').toLowerCase();
     if (role === 'checkbox' || role === 'switch' || type === 'checkbox' || type === 'radio' || role === 'radio') return 'checkbox';
     if (tag === 'input' && /^(submit|button|reset|image)$/.test(type)) return 'button';
-    if (el.matches(FIELD)) return 'field';
     if (tag === 'select') return 'list';
+    if (el.matches(FIELD)) return 'field';
     if (tag === 'a' || role === 'link') return 'link';
     if (role === 'tab') return 'tab';
     if (role.startsWith('menuitem') || role === 'option') return 'menu item';
@@ -1816,9 +1816,41 @@
     return s;
   }
 
+  // Sites build buttons out of plain boxes too (thumbnails, cards, menus). The
+  // hand pointer gives them away (the trick Nanobrowser's buildDomTree uses).
+  // Only the outermost one counts, and only near what you can see.
+  function pointerBoxes(seen) {
+    const out = [];
+    const all = document.querySelectorAll('div, span, li, img, svg, td, [tabindex]');
+    for (let i = 0, n = 0; i < all.length && n < 5000 && out.length < 200; i++) {
+      const el = all[i];
+      if (seen.has(el)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.bottom < -innerHeight || r.top > innerHeight * 2 || r.width < 8 || r.height < 8) continue;
+      n++;
+      if (getComputedStyle(el).cursor !== 'pointer') continue;
+      const up = el.parentElement;
+      if (up && up !== document.body && getComputedStyle(up).cursor === 'pointer') continue; // part of a bigger one
+      if (el.closest(CLICKABLE) || el.querySelector(CLICKABLE)) continue; // a real button or link already covers it
+      out.push(el);
+    }
+    return out;
+  }
+
+  // Something on top of it (a popup, a sticky bar): a click would land there instead.
+  function covered(el) {
+    const r = el.getBoundingClientRect();
+    if (r.bottom <= 0 || r.top >= innerHeight) return false;
+    const x = clamp(r.left + r.width / 2, 0, innerWidth - 1);
+    const y = clamp(r.top + r.height / 2, 0, innerHeight - 1);
+    const hit = document.elementFromPoint(x, y);
+    return !!hit && hit !== el && !el.contains(hit) && !hit.contains(el) && hit.id !== 'spiderpet-host';
+  }
+
   function candidates(fieldsOnly) {
     const out = [];
-    const all = document.querySelectorAll(fieldsOnly ? FIELD : CLICKABLE);
+    const all = [...document.querySelectorAll(fieldsOnly ? FIELD : CLICKABLE)];
+    if (!fieldsOnly) all.push(...pointerBoxes(new Set(all)));
     for (let i = 0; i < all.length && out.length < 3000; i++) {
       const el = all[i];
       if (el.closest('#spiderpet-host, .spiderpet-badge') || el.disabled || !shown(el)) continue;
@@ -1912,8 +1944,9 @@
     if (RISKY.test(c.label)) return true;
     const form = el.form || el.closest?.('form');
     const searchForm = form && (form.getAttribute('role') === 'search' || [...form.elements].some((x) => searchBox(x)));
-    if (form?.querySelector('input[type=password]')) return true; // logging in or signing up
+    // Typing alone sends nothing; typing and pressing Enter sends the form (unless it is a search).
     if (step.verb === 'type') return !!step.enter && !searchBox(el);
+    if (form?.querySelector('input[type=password]')) return true; // logging in or signing up
     // A form's send button (not a search).
     const submits = el.matches('button:not([type=button]):not([type=reset]), input[type=submit], input[type=image]');
     return !!(form && submits && !searchForm);
@@ -1922,29 +1955,92 @@
   // What the page offers right now, for the AI that plans a task: some of its
   // text and a numbered list of what can be clicked or typed into.
   let snapEls = [];
+  let lastSnap = { url: '', els: new WeakSet() };
   function snapshot() {
     const all = candidates(false);
     for (const f of candidates(true)) if (!all.some((c) => c.el === f.el)) all.push(f);
     // On screen first, then the rest in reading order; only things with a name.
     all.sort((a, b) => (b.inView - a.inView) || a.order - b.order);
-    snapEls = all.filter((c) => c.label || c.kind === 'field').filter((c) => !secret(c.el)).slice(0, 90);
+    snapEls = all.filter((c) => c.label || c.kind === 'field' || c.kind === 'list').filter((c) => !secret(c.el)).slice(0, 90);
+    const sameUrl = lastSnap.url === pageUrl();
+    const before = lastSnap.els;
+    lastSnap = { url: pageUrl(), els: new WeakSet(snapEls.map((c) => c.el)) };
     const root = mainRoot();
     const text = squash((root.innerText || document.body.innerText || '').slice(0, 6000)).slice(0, 2500);
     return {
       url: pageUrl(),
       title: document.title,
       text,
+      media: mediaOnPage().map((m) => ({
+        kind: m.tagName.toLowerCase(),
+        playing: !m.paused && !m.ended && m.readyState > 2,
+        time: Math.round(m.currentTime || 0),
+        duration: Math.round(m.duration || 0) || 0,
+        muted: m.muted,
+      })),
       scroll: Math.round((scrollY / Math.max(1, document.documentElement.scrollHeight - innerHeight)) * 100) || 0,
       items: snapEls.map((c, i) => ({
         i,
         kind: c.kind,
         label: c.label,
         href: c.el.href ? String(c.el.href).slice(0, 90) : '',
-        value: c.kind === 'field' && 'value' in c.el ? String(c.el.value || '').slice(0, 60) : '',
+        value:
+          c.kind === 'list'
+            ? String(c.el.selectedOptions?.[0]?.text || '').slice(0, 60)
+            : c.kind === 'field' && 'value' in c.el
+              ? String(c.el.value || '').slice(0, 60)
+              : '',
+        options: c.kind === 'list' ? [...c.el.options].slice(0, 20).map((o) => squash(o.text).slice(0, 40)) : undefined,
         inView: c.inView,
         search: c.kind === 'field' && searchBox(c.el),
+        fresh: sameUrl && !before.has(c.el),
+        covered: c.inView && covered(c.el),
       })),
     };
+  }
+
+  // The videos and songs on the page that are really there (biggest first).
+  function mediaOnPage() {
+    const area = (m) => {
+      const r = m.getBoundingClientRect();
+      return m.tagName === 'AUDIO' ? 1 : r.width * r.height;
+    };
+    return [...document.querySelectorAll('video, audio')]
+      .filter((m) => m.currentSrc || m.src || m.duration > 0)
+      .filter((m) => m.tagName === 'AUDIO' || area(m) > 2000)
+      .sort((a, b) => area(b) - area(a))
+      .slice(0, 3);
+  }
+
+  // Play or pause the main video. Browsers block sound until you have clicked
+  // the page; then it plays without sound and the app tells you.
+  async function doMedia(op) {
+    const m = mediaOnPage()[0];
+    if (!m) return actFail('there is no video or audio on this page.');
+    const seq = act.seq;
+    const report = (ok, note) => {
+      if (act?.seq !== seq) return;
+      actReport({ type: 'act-done', ok, note });
+      think(note, 4);
+      endAct();
+    };
+    if (op === 'pause') {
+      m.pause();
+      return report(true, 'paused');
+    }
+    try {
+      await m.play();
+      report(true, 'playing');
+    } catch (e) {
+      if (e?.name !== 'NotAllowedError') return report(false, String(e?.message || e));
+      try {
+        m.muted = true;
+        await m.play();
+        report(true, 'playing without sound: your browser blocks sound until you click the page. Click the speaker to hear it.');
+      } catch (e2) {
+        report(false, 'your browser blocked playing it. Press play on the page once.');
+      }
+    }
   }
 
   // Lock on to the chosen element: the spider walks there and the app asks you.
@@ -1974,6 +2070,19 @@
       else if (d === 'bottom') scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' });
       else scrollBy({ top: (d === 'up' ? -0.8 : 0.8) * innerHeight, behavior: 'smooth' });
       actReport({ type: 'act-done', ok: true, note: 'scrolled' });
+      act = null;
+      return;
+    }
+    if (step.verb === 'media') return doMedia(step.op);
+    if (step.verb === 'key') {
+      // Escape closes a menu, Tab moves on, arrows move through a list. Enter is not here: typing does it.
+      const k = String(step.key || '');
+      if (!/^(Escape|Tab|ArrowUp|ArrowDown|ArrowLeft|ArrowRight|PageUp|PageDown|Home|End| )$/.test(k)) return actFail(`can't press "${k}".`);
+      const el = document.activeElement || document.body;
+      const o = { key: k, code: k === ' ' ? 'Space' : k, bubbles: true, cancelable: true, composed: true };
+      el.dispatchEvent(new KeyboardEvent('keydown', o));
+      el.dispatchEvent(new KeyboardEvent('keyup', o));
+      actReport({ type: 'act-done', ok: true, note: `pressed ${k === ' ' ? 'Space' : k}` });
       act = null;
       return;
     }
@@ -2036,6 +2145,17 @@
   function doType(el, text, enter) {
     if (secret(el)) throw new Error('that is a password or payment field: the spider never types there.');
     el.focus?.({ preventScroll: true });
+    if (el.tagName === 'SELECT') {
+      // A list: the choice whose words fit best.
+      const want = words(text);
+      const opts = [...el.options];
+      const o = opts.find((x) => words(x.text) === want) || opts.find((x) => words(x.text).includes(want)) || opts.find((x) => want.includes(words(x.text)) && words(x.text));
+      if (!o) throw new Error(`"${short2(text, 30)}" is not one of the choices.`);
+      el.value = o.value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return;
+    }
     if (el.isContentEditable) {
       document.execCommand('selectAll', false);
       document.execCommand('insertText', false, text);
