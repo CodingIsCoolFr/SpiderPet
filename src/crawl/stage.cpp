@@ -92,7 +92,7 @@ struct Stage::Impl {
   ComPtr<IDCompositionTarget> dtarget;
   ComPtr<IDCompositionVisual> visual;
   ComPtr<IDWriteFactory> dw;
-  ComPtr<IDWriteTextFormat> f_name, f_text, f_hud, f_badge, f_icon;
+  ComPtr<IDWriteTextFormat> f_name, f_text, f_wrap, f_hud, f_badge, f_icon;
   ComPtr<ID2D1SolidColorBrush> brush;
   ComPtr<ID2D1StrokeStyle> round, dotted, dashed;
   UINT width = 0, height = 0;
@@ -122,6 +122,8 @@ struct Stage::Impl {
   // The thought cloud: typed out, then left up to be read.
   std::wstring bubble;
   float bubble_age = 99, bubble_life = 0;
+  std::wstring bubble_measured;  // the thought its size was worked out for
+  float bubble_tw = 0, bubble_th = 0;
 
   // Picking a window: the spider follows the cursor.
   std::atomic<bool> picking{false};
@@ -242,6 +244,8 @@ struct Stage::Impl {
     };
     fmt(L"Segoe UI", DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, 10.5f, f_name);
     fmt(L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, 13.f, f_text);
+    fmt(L"Segoe UI", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, 13.f, f_wrap);
+    if (f_wrap) f_wrap->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
     fmt(L"Cascadia Mono", DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, 11.f, f_hud);
     fmt(L"Segoe UI", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, 10.5f, f_badge);
     fmt(L"Segoe UI Symbol", DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, 9.5f, f_icon);
@@ -684,8 +688,19 @@ struct Stage::Impl {
     size_t n = std::min(bubble.size(), size_t(bubble_age * 32.f) + 1);
     std::wstring shown = bubble.substr(0, n);
     std::wstring name = wide(name_u8);
-    float tw = std::min(460 * s, std::max(text_width(bubble, f_text.Get()), text_width(name, f_name.Get())));
-    float w = tw + 40 * s, h = 46 * s;
+    // A long thought wraps (up to four lines) instead of running out of the
+    // cloud; the cloud has its final size from the first letter on.
+    if (bubble_measured != bubble + L"|" + name) {
+      bubble_measured = bubble + L"|" + name;
+      bubble_tw = std::min(460 * s, std::max(text_width(bubble, f_text.Get()), text_width(name, f_name.Get())));
+      bubble_th = 17;
+      ComPtr<IDWriteTextLayout> lay;
+      dw->CreateTextLayout(bubble.c_str(), UINT32(bubble.size()), f_wrap.Get(), bubble_tw, 2000, &lay);
+      DWRITE_TEXT_METRICS m{};
+      if (lay && SUCCEEDED(lay->GetMetrics(&m))) bubble_th = std::min(m.height, 4 * m.height / std::max(1u, m.lineCount));
+    }
+    float tw = bubble_tw;
+    float w = tw + 40 * s, h = std::max(46 * s, 27 * s + bubble_th + 4 * s);
     float x = std::clamp(body.x + 10 * s, 4.f, std::max(4.f, clip_r - w - 6));
     float y = std::max(top_limit + 10 * s, body.y - 76 * s - h);
     if (top_limit < -1e8f) y = body.y - 76 * s - h;
@@ -726,7 +741,7 @@ struct Stage::Impl {
       dc->DrawEllipse(D2D1::Ellipse({p.x, p.y}, radii[i] * s, radii[i] * s), brush.Get(), 1.2f * s);
     }
     text(name, f_name.Get(), D2D1::RectF(x + 18 * s, y + 6 * s, x + w - 6 * s, y + 22 * s), col(kJoint, a));
-    text(shown, f_text.Get(), D2D1::RectF(x + 18 * s, y + 21 * s, x + w - 6 * s, y + h), D2D1::ColorF(1, 1, 1, a));
+    text(shown, f_wrap.Get(), D2D1::RectF(x + 18 * s, y + 21 * s, x + 18 * s + tw + 1, y + h - 3 * s), D2D1::ColorF(1, 1, 1, a));
   }
 
   static bool tagged(const Mark& m) {

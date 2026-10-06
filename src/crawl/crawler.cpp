@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -51,6 +53,15 @@ std::string clip(const std::string& s, size_t n) {
   if (s.size() <= n) return s;
   size_t cut = n;
   while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) --cut;  // not inside a UTF-8 letter
+  return s.substr(0, cut) + "\xE2\x80\xA6";
+}
+
+// Shorter, cut between words (for the thought cloud).
+std::string clip_words(const std::string& s, size_t n) {
+  if (s.size() <= n) return s;
+  size_t cut = s.rfind(' ', n);
+  if (cut == std::string::npos || cut < n / 2) return clip(s, n);
+  while (cut > 0 && std::strchr(",;:-", s[cut - 1])) --cut;
   return s.substr(0, cut) + "\xE2\x80\xA6";
 }
 
@@ -303,11 +314,28 @@ struct Crawler::Impl {
           scene.marks.push_back(Mark{f.id, f.kind, f.text, f.boxes, f.eaten, hits(f.text) > 0, f.verdict, f.boxes_ms, f.boxes_layout});
       scene.read.clear();
       scene.columns.clear();
+      // Silk beside what it read: one thread down the left edge of the text,
+      // not a dash per paragraph. Paragraphs read one after another, close
+      // together and starting near the same edge, share a thread (a list
+      // indented under a paragraph joins it, so the thread stays clear of its
+      // numbers). Only on a page or document: an app's rows have icons there.
+      eyes::Box run;
       for (size_t i = 0; i < spans.size(); ++i) {
-        if (spans[i].empty()) continue;
-        scene.columns.push_back(spans[i]);
-        if (i < seen_block.size() && seen_block[i]) scene.read.push_back(spans[i]);
+        const eyes::Box& sp = spans[i];
+        if (sp.empty()) continue;
+        scene.columns.push_back(sp);
+        if (how != "page" || i >= seen_block.size() || !seen_block[i]) continue;
+        bool joins = !run.empty() && sp.y >= run.y - 4 && sp.y - (run.y + run.h) < 48 && std::fabs(sp.x - run.x) < 64;
+        if (joins) {
+          float bottom = std::max(run.y + run.h, sp.y + sp.h);
+          run.x = std::min(run.x, sp.x);
+          run.h = bottom - run.y;
+        } else {
+          if (!run.empty()) scene.read.push_back(run);
+          run = eyes::Box{sp.x, sp.y, 1, sp.h};
+        }
       }
+      if (!run.empty()) scene.read.push_back(run);
       scene.spans_layout = spans_layout;
       stage->set(scene);
       publish(st);
@@ -1021,7 +1049,7 @@ struct Crawler::Impl {
     } else if (type == "gist") {
       if (jstr(m, "url") == url) {
         std::string s = jstr(m.value("gist", json::object()), "summary");
-        if (!s.empty()) say(clip(s, 110), true);
+        if (!s.empty()) say(clip_words(s, 200), true);  // the cloud wraps it onto up to four lines
       }
     } else if (type == "answer") {
       std::string tx = jstr(m, "text");
