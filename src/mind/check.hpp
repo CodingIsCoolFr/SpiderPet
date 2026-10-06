@@ -63,6 +63,11 @@ class Checker {
   nlohmann::json understand(const std::string& goal, const std::string& page, bool think = false);
   // One sentence, up to three key points, and what kind of page it is.
   nlohmann::json gist(const std::string& title, const std::string& url, const std::string& text);
+  // The model looks at a window: a picture of it (JPEG base64), what the app
+  // calls itself, its title, its text and its buttons. -> {app, view, doing,
+  // summary, points, type, next}. Null without the model.
+  nlohmann::json see(const std::string& app, const std::string& title, const std::string& text,
+                     const std::string& picture, bool think = false);
   // True for a while after the model got squeezed out of the graphics card
   // (another app took the memory): model work waits, so the PC stays smooth.
   bool gpu_busy() const;
@@ -80,7 +85,7 @@ class Checker {
   // Ask the local model for JSON that fits `schema`. Null when it cannot.
   // think: let a thinking model (Qwen3) reason before it answers: smarter, slower.
   nlohmann::json ask(const std::string& system, const std::string& user, const nlohmann::json& schema,
-                     int max_tokens = 300, bool think = false);
+                     int max_tokens = 300, bool think = false, const std::string& picture = "");
   std::string pick_model();
   bool fits(const std::string& model);
   void load_cache();

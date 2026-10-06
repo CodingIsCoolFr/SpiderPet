@@ -1,5 +1,5 @@
-# Rebuilds SpiderPet and puts SpiderPet.exe, SpiderHost.exe and the browser
-# extension (extension\chromium, extension\firefox) next to this script.
+# Rebuilds SpiderPet and puts SpiderPet.exe next to this script (the
+# SpiderSee.exe test tool stays in build\Release).
 # Needs Visual Studio 2022 (C++), CMake and vcpkg (found through VCPKG_ROOT or
 # ~\vcpkg). vcpkg.json lists the libraries; the first build installs them into build\.
 $ErrorActionPreference = "Stop"
@@ -13,7 +13,7 @@ cmake --build "$root\build" --config Release
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 
 # A running exe cannot be overwritten, but it can be renamed out of the way.
-foreach ($name in "SpiderPet", "SpiderHost") {
+foreach ($name in "SpiderPet") {
   Remove-Item "$root\$name.old.exe" -Force -ErrorAction SilentlyContinue
   if (Test-Path "$root\$name.exe") {
     try { Remove-Item "$root\$name.exe" -Force -ErrorAction Stop }
@@ -22,5 +22,4 @@ foreach ($name in "SpiderPet", "SpiderHost") {
   Copy-Item "$root\build\Release\$name.exe" "$root\$name.exe" -Force
 }
 
-& "$root\extension\build.ps1"
-Write-Host "Built $root\SpiderPet.exe, SpiderHost.exe and the extension (restart SpiderPet if it was open)"
+Write-Host "Built $root\SpiderPet.exe (restart SpiderPet if it was open)"

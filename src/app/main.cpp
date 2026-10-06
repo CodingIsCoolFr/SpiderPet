@@ -1,15 +1,17 @@
-// SpiderPet.exe: the brain and the library behind the browser spider.
+// SpiderPet.exe: a spider you drop on any window.
 //
-// The extension walks the page and harvests DOIs, ISBNs, ids, titles, links
-// and key sentences from the real page text. Everything it finds comes here
-// (through SpiderHost.exe), is checked against real sources with the local
-// model as the judge, ranked against what you are looking for, and kept in
-// one library across browsers. The window shows it; the tray keeps it running.
+// No browser extension: the crawler reads the window through Windows' own
+// screen-reader interface (and its pixels when that shows little), walks the
+// spider over it, and harvests DOIs, ISBNs, ids, titles, links and key
+// sentences. Everything it finds comes here, is checked against real sources
+// with the local model as the judge, ranked against what you are looking
+// for, and kept in one library. The window shows it; the tray keeps it running.
 //
 //   SpiderPet.exe          open the window
-//   SpiderPet.exe --tray   start in the tray (what SpiderHost does)
-#include "app/bridge.hpp"
+//   SpiderPet.exe --tray   start in the tray
 #include "app/library.hpp"
+#include "crawl/crawler.hpp"
+#include "eyes/eyes.hpp"
 #include "core/util.hpp"
 #include "mind/check.hpp"
 
@@ -47,7 +49,7 @@ namespace {
 constexpr UINT kTrayMsg = WM_APP + 1;
 constexpr UINT kShowMsg = WM_APP + 2;
 constexpr UINT kWakeMsg = WM_APP + 3;
-constexpr const char* kVersion = "3.6.0";
+constexpr const char* kVersion = "4.0.0";
 
 ImVec4 hexv(uint32_t c, float a = 1.f) {
   return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
@@ -635,7 +637,7 @@ class App {
   Library lib_;
   Settings settings_;
   Checker checker_;
-  Bridge bridge_;
+  crawl::Crawler bridge_;  // the spider: reads any window and acts in it (no extension)
   std::map<int, Browser> browsers_;      // by client
   std::string active_url_;               // the page "This page" shows: the tab you are on
   json terms_ = json::array();           // the search as words to match: yours first, then the model's
@@ -684,8 +686,6 @@ class App {
   std::condition_variable cv_;
   std::thread worker_;
   std::atomic<bool> quit_{false};
-  bool registered_ = false;
-  std::wstring register_error_;
 
   // UI state
   char goal_[512] = {};
@@ -701,6 +701,8 @@ class App {
   bool goal_force_ = false;
   bool focus_goal_ = false;  // the window just opened: the search box takes the keyboard
   std::optional<std::string> pending_goal_;
+  std::string test_goal_;  // --goal: typed in for a test
+  std::set<std::string> gist_pending_;  // pages whose summary is being written
   std::optional<bool> pending_spider_;
   std::string armed_;        // the forget button that was clicked once and waits for the second click
   double armed_at_ = -100;
@@ -721,16 +723,46 @@ int App::run(HINSTANCE inst, bool tray) {
   terms_ = quick_terms(settings_.goal);
   if (!settings_.goal.empty()) urgent_.push_back({Job::Expand, "", "", {{"goal", settings_.goal}, {"seq", goal_seq_}}});
 
-  const std::wstring host = exe_dir() + L"\\SpiderHost.exe";
-  if (_wgetenv(L"SPIDERPET_DATA")) registered_ = true;  // a test copy: leave the real registration alone
-  else if (GetFileAttributesW(host.c_str()) != INVALID_FILE_ATTRIBUTES) registered_ = register_native_host(host, &register_error_);
-  else register_error_ = L"SpiderHost.exe is missing next to SpiderPet.exe";
-
   status_ = checker_.status();  // so the first hello already knows about the model
   if (!create_window(inst, !tray)) return 1;
   tray_add();
+  // Ctrl+Alt+S drops the spider on the window you are in.
+  RegisterHotKey(hwnd_, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'S');
   bridge_.start([this](int c, const json& m) { on_message(c, m); }, [this](int c) { on_gone(c); });
   worker_ = std::thread([this] { worker(); });
+  // Test hook: --drop "<part of a window title>" puts the spider on that window.
+  {
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (int i = 1; i + 1 < argc; ++i)
+      if (std::wstring(argv[i]) == L"--drop") {
+        struct Find {
+          std::wstring want;
+          HWND h = nullptr;
+        } f{argv[i + 1]};
+        EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+          auto* f = reinterpret_cast<Find*>(lp);
+          wchar_t t[512] = {};
+          GetWindowTextW(h, t, 512);
+          if (IsWindowVisible(h) && wcsstr(t, f->want.c_str()) && !eyes::is_ours(h)) {
+            f->h = h;
+            return FALSE;
+          }
+          return TRUE;
+        }, reinterpret_cast<LPARAM>(&f));
+        if (f.h) bridge_.drop_on(f.h);
+      } else if (std::wstring(argv[i]) == L"--goal") {
+        // Test hook: --goal "<words, a question or a task>" as if typed in the search box.
+        test_goal_ = utf8(argv[i + 1]);
+        snprintf(goal_, sizeof(goal_), "%s", test_goal_.c_str());
+        HWND w = hwnd_;
+        std::thread([w] {
+          Sleep(4000);  // the spider settles on its window first
+          PostMessageW(w, WM_APP + 9, 0, 0);
+        }).detach();
+      }
+    LocalFree(argv);
+  }
 
   double saved_at = now_seconds();
   MSG msg;
@@ -762,6 +794,7 @@ int App::run(HINSTANCE inst, bool tray) {
 
   quit_ = true;
   cv_.notify_all();
+  UnregisterHotKey(hwnd_, 1);
   bridge_.stop();
   if (worker_.joinable()) worker_.join();
   {
@@ -820,6 +853,8 @@ static json without_marks(const json& j) {
 void App::on_message(int client, const json& raw) {
   const json m = without_marks(raw);
   const std::string type = jstr(m, "type");
+  if (type.rfind("act", 0) == 0 || type == "snap")
+    debug_log("task: " + type + " " + jstr(m, "desc") + jstr(m, "note") + (m.contains("ok") ? (m.value("ok", false) ? " (ok)" : " (failed)") : ""));
   std::unique_lock lock(mu_);
   if (type == "hello") {
     browsers_[client].name = jstr(m, "browser").empty() ? "browser" : jstr(m, "browser");
@@ -876,8 +911,8 @@ void App::on_message(int client, const json& raw) {
       const json g = {{"type", "gist"}, {"url", url}, {"gist", (*p)["gist"]}};
       lock.unlock();
       bridge_.send(client, g);
-    } else if (!jstr(m, "text").empty()) {
-      urgent_.push_back({Job::Gist, url, "", {{"title", jstr(m, "title")}, {"text", jstr(m, "text")}}});
+    } else if (!jstr(m, "text").empty() && gist_pending_.insert(url).second) {
+      urgent_.push_back({Job::Gist, url, "", {{"title", jstr(m, "title")}, {"text", jstr(m, "text")}, {"app", jstr(m, "app")}, {"how", jstr(m, "how")}}});
       cv_.notify_all();
     }
     wake();
@@ -1156,6 +1191,7 @@ void App::worker() {
         }
         lib_.set_verdict(job.id, v);
       }
+      debug_log("check: " + jstr(find, "kind") + " " + jstr(find, "text").substr(0, 70) + " -> " + jstr(v, "status") + " " + jstr(v, "note").substr(0, 90));
       bridge_.broadcast({{"type", "verdict"}, {"url", jstr(find, "url")}, {"id", job.id}, {"verdict", v}});
     } else if (job.type == Job::Rank) {
       std::string goal, title;
@@ -1182,12 +1218,27 @@ void App::worker() {
         busy_ = "reading the page";
       }
       wake();
-      const json g = checker_.gist(jstr(job.data, "title"), job.url, jstr(job.data, "text"));
+      // A web page is read; any other window is also looked at, with the model's own eyes.
+      const std::string how = jstr(job.data, "how");
+      json g;
+      if (how == "app" || how == "picture" || jstr(job.data, "text").size() < 300) {
+        {
+          std::lock_guard lock(mu_);
+          busy_ = "looking at the window";
+        }
+        wake();
+        const std::string pic = bridge_.picture(1280);
+        g = checker_.see(jstr(job.data, "app"), jstr(job.data, "title"), jstr(job.data, "text"), pic, false);
+      } else {
+        g = checker_.gist(jstr(job.data, "title"), job.url, jstr(job.data, "text"));
+      }
       {
         std::lock_guard lock(mu_);
         if (!g.contains("error")) lib_.set_gist(job.url, g);
+        gist_pending_.erase(job.url);
         busy_.clear();
       }
+      debug_log("gist: " + job.url.substr(0, 80) + " -> " + g.dump().substr(0, 300));
       bridge_.broadcast({{"type", "gist"}, {"url", job.url}, {"gist", g}});
     } else if (job.type == Job::Expand) {
       const std::string goal = jstr(job.data, "goal");
@@ -1972,10 +2023,20 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_CLOSE:
-      hide();  // the browser stays connected; quit from the tray
+      hide();  // the spider stays where it is; quit from the tray
       return 0;
+    case WM_HOTKEY: {
+      HWND fg = GetForegroundWindow();
+      HWND root = fg ? GetAncestor(fg, GA_ROOT) : nullptr;
+      if (root && !eyes::is_ours(root)) bridge_.drop_on(root);
+      else bridge_.pick();
+      return 0;
+    }
     case kShowMsg:
       show();
+      return 0;
+    case WM_APP + 9:
+      if (!test_goal_.empty()) commit_goal(test_goal_, true);
       return 0;
     case kTrayMsg:
       if (LOWORD(lp) == WM_LBUTTONUP || LOWORD(lp) == WM_LBUTTONDBLCLK) {
@@ -1983,6 +2044,8 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
       } else if (LOWORD(lp) == WM_RBUTTONUP) {
         HMENU m = CreatePopupMenu();
         AppendMenuW(m, MF_STRING, 1, L"Open SpiderPet");
+        AppendMenuW(m, MF_STRING, 3, L"Drop the spider on a window");
+        AppendMenuW(m, MF_STRING | (bridge_.clients() ? 0 : MF_GRAYED), 4, L"Take the spider off");
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(m, MF_STRING, 2, L"Quit");
         POINT p;
@@ -1992,6 +2055,8 @@ LRESULT App::handle(UINT msg, WPARAM wp, LPARAM lp) {
         DestroyMenu(m);
         if (cmd == 1) show();
         if (cmd == 2) quitting_ = true;
+        if (cmd == 3) bridge_.pick();
+        if (cmd == 4) bridge_.lift();
       }
       return 0;
     case WM_ERASEBKGND:
@@ -2060,7 +2125,7 @@ void App::draw() {
     std::lock_guard lock(mu_);
     draw_header();
     if (ImGui::BeginTabBar("##tabs")) {
-      if (ImGui::BeginTabItem("This page")) {
+      if (ImGui::BeginTabItem("This window")) {
         draw_page();
         ImGui::EndTabItem();
       }
@@ -2072,7 +2137,7 @@ void App::draw() {
         draw_settings();
         ImGui::EndTabItem();
       }
-      if (ImGui::BeginTabItem("Setup")) {
+      if (ImGui::BeginTabItem("How it works")) {
         draw_setup();
         ImGui::EndTabItem();
       }
@@ -2119,13 +2184,12 @@ void App::draw_header() {
     ImGui::Dummy(ImVec2(r * 2 + 4 * scale_, ImGui::GetTextLineHeight()));
     ImGui::SameLine(0, 0);
   };
-  std::set<std::string> names;
-  for (auto& [c, br] : browsers_)
-    if (!br.name.empty()) names.insert(br.name);
-  std::string b;
-  for (const auto& n : names) b += (b.empty() ? "" : ", ") + n;
-  dot(!names.empty());
-  ImGui::Text(names.empty() ? "no browser connected" : "%s connected", b.c_str());
+  const json crawl = bridge_.status();
+  const bool on_window = crawl.value("on", false);
+  dot(on_window);
+  if (crawl.value("picking", false)) ImGui::TextUnformatted("click a window to drop the spider there");
+  else if (on_window) ImGui::Text("on %s", jstr(crawl, "app").c_str());
+  else ImGui::TextUnformatted("the spider is resting");
   ImGui::SameLine(0, 18 * scale_);
   const bool ai = status_.value("ollama", false) && !jstr(status_, "model").empty();
   dot(ai);
@@ -2147,8 +2211,8 @@ void App::draw_header() {
   // the spider after it; Enter sends it again (on a new page, say).
   const Browser* cur = current();
   const bool on = cur && cur->spider;
-  const char* label = on ? "Stop spider" : "Start spider";
-  const float bw = ImGui::CalcTextSize("Start spider").x + ImGui::GetStyle().FramePadding.x * 2 + 8 * scale_;
+  const char* label = !on_window ? "Drop the spider" : on ? "Stop spider" : "Start spider";
+  const float bw = ImGui::CalcTextSize("Drop the spider").x + ImGui::GetStyle().FramePadding.x * 2 + 8 * scale_;
   ImGui::SetNextItemWidth(-(bw + ImGui::GetStyle().ItemSpacing.x));
   if (focus_goal_) {
     ImGui::SetKeyboardFocusHere();
@@ -2170,22 +2234,35 @@ void App::draw_header() {
     pending_goal_ = std::string(goal_);  // sent after this frame, outside the lock
   }
   ImGui::SameLine();
-  ImGui::BeginDisabled(!cur || (!cur->web && !on));
   if (on) {
     ImGui::PushStyleColor(ImGuiCol_Button, hexv(0x5A2368));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hexv(0x6E2C80));
   }
-  if (ImGui::Button(label, ImVec2(bw, 0))) pending_spider_ = !on;
+  if (ImGui::Button(label, ImVec2(bw, 0))) {
+    if (!on_window) bridge_.pick();
+    else pending_spider_ = !on;
+  }
   if (on) ImGui::PopStyleColor(2);
-  ImGui::EndDisabled();
+  if (ImGui::IsItemHovered() && !on_window)
+    ImGui::SetTooltip("Then click any window: a browser page, a chat, a document, a game. Or press Ctrl+Alt+S in that window.");
 
-  // Where the spider would go: the tab you are on in your browser.
+  // Where the spider is, and how much of it it has read.
   ImGui::PushFont(small_, small_->LegacySize);
-  if (!cur) ImGui::TextDisabled("Open your browser: the spider works on the tab you are looking at.");
-  else if (!cur->web) ImGui::TextDisabled("%s tab: a browser page. Open a web page for the spider.", cur->name.c_str());
-  else
-    ImGui::TextDisabled("%s tab: %s%s", cur->name.c_str(), cur->title.substr(0, 80).c_str(),
-                        on ? (terms_.empty() ? "   (spider on)" : "   (spider hunting)") : "");
+  if (!on_window) {
+    ImGui::TextDisabled(crawl.contains("error") ? jstr(crawl, "error").c_str()
+                                                : "Drop the spider on any window, or press Ctrl+Alt+S in it.");
+  } else {
+    const int blocks = crawl.value("blocks", 0), seen = crawl.value("seen", 0), all = crawl.value("finds", 0), eaten = crawl.value("eaten", 0);
+    const std::string how = jstr(crawl, "how");
+    ImGui::TextDisabled("%s: %s", jstr(crawl, "app").c_str(), jstr(crawl, "title").substr(0, 80).c_str());
+    ImGui::TextDisabled("read %d of %d parts on screen \xC2\xB7 ate %d of %d finds%s%s", seen, blocks, eaten, all,
+                        how == "picture" ? " \xC2\xB7 read from the picture" : "",
+                        on ? (terms_.empty() ? "   (spider on)" : "   (spider hunting)") : "   (spider stopped)");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Move it")) bridge_.pick();
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Off")) bridge_.lift();
+  }
   ImGui::PopFont();
   if (!notice_.empty() && now_seconds() - notice_at_ < 6) wrapped(0xFFC46B, notice_);
   draw_task();
@@ -2286,9 +2363,8 @@ void App::draw_page() {
   const json* p = active_url_.empty() ? nullptr : lib_.page(active_url_);
   if (!p) {
     ImGui::Spacing();
-    ImGui::TextWrapped("Open a page in your browser. Then type what you are looking for above, or press Start spider. "
-                       "What the spider finds shows up here, with a check for each find.");
-    if (!registered_) ImGui::TextColored(hexv(0xFF5C5C), "The browser connection is not set up. See Setup.");
+    ImGui::TextWrapped("Press Drop the spider and click any window (or press Ctrl+Alt+S in it). Then type what you are "
+                       "looking for above, or a question, or a task. What the spider finds shows up here, with a check for each find.");
     return;
   }
   ImGui::PushFont(bold_, bold_->LegacySize);
@@ -2332,12 +2408,21 @@ void App::draw_page() {
     const json& g = (*p)["gist"];
     ImGui::BeginChild("##gist", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PushFont(small_, small_->LegacySize);
-    ImGui::TextColored(hexv(0xE64CF2), "%s", jstr(g, "type").c_str());
+    ImGui::TextColored(hexv(0xE64CF2), "%s%s%s", jstr(g, "type").c_str(), jstr(g, "app").empty() ? "" : "  \xC2\xB7  ", jstr(g, "app").c_str());
     ImGui::PopFont();
+    if (!jstr(g, "view").empty()) wrapped_dim(jstr(g, "view"));
     ImGui::TextWrapped("%s", jstr(g, "summary").c_str());
+    if (!jstr(g, "doing").empty()) wrapped(0x7DF0A3, "You seem to be: " + jstr(g, "doing"));
     if (g.contains("points") && g["points"].is_array())
       for (const json& pt : g["points"])
         if (pt.is_string()) bullet_wrapped(pt.get<std::string>());
+    if (g.contains("next") && g["next"].is_array() && !g["next"].empty()) {
+      ImGui::PushFont(small_, small_->LegacySize);
+      ImGui::TextColored(hexv(0x7D8BFF), "It could:");
+      ImGui::PopFont();
+      for (const json& nx : g["next"])
+        if (nx.is_string()) bullet_wrapped(nx.get<std::string>());
+    }
     ImGui::EndChild();
   }
   ImGui::Spacing();
@@ -2437,11 +2522,11 @@ void App::draw_settings() {
   changed |= ImGui::Checkbox("Check every find as it is harvested", &s.auto_check);
   changed |= ImGui::Checkbox("Check claims in sentences the spider reads or that match your search (slower)", &s.check_sentences);
   changed |= ImGui::Checkbox("Work through the whole page, not only the part you see (it never scrolls your page)", &s.crawl);
-  changed |= ImGui::Checkbox("Tuck away popups, cookie banners and sign-up walls that block the page", &s.popups);
+  changed |= ImGui::Checkbox("Show the spider in screen shares and recordings", &s.show_in_shares);
   ImGui::PushFont(small_, small_->LegacySize);
   ImGui::Indent();
-  ImGui::TextWrapped("The spider hides them; it never clicks Accept or anything else. Unclear ones go to the local AI. "
-                     "Stop the spider and they come back.");
+  ImGui::TextWrapped("Discord, OBS, Teams and screenshots see it too. When the spider takes its own picture of a window, "
+                     "it steps out of the picture for a moment, so it never reads itself.");
   ImGui::Unindent();
   ImGui::PopFont();
   changed |= ImGui::Checkbox("Tasks: let the AI think before each step (smarter, slower)", &s.think_tasks);
@@ -2497,44 +2582,28 @@ void App::draw_settings() {
 void App::draw_setup() {
   ImGui::Spacing();
   ImGui::PushTextWrapPos(0);
-  ImGui::TextColored(hexv(registered_ ? 0x8BF5A6 : 0xFF5C5C), registered_ ? "Browsers know where SpiderPet is."
-                                                                          : "Browser connection not set up.");
-  if (!registered_ && !register_error_.empty()) ImGui::TextDisabled("%s", utf8(register_error_).c_str());
-  if (ImGui::Button("Connect browsers again")) {
-    const std::wstring host = exe_dir() + L"\\SpiderHost.exe";
-    registered_ = register_native_host(host, &register_error_);
-  }
-  ImGui::Spacing();
-  ImGui::PushFont(bold_, bold_->LegacySize);
-  ImGui::TextUnformatted("Brave, Chrome, Edge");
-  ImGui::PopFont();
-  ImGui::TextUnformatted("1. Open brave://extensions (or chrome://extensions, edge://extensions).");
-  ImGui::TextUnformatted("2. Turn on Developer mode.");
-  ImGui::TextUnformatted("3. Click Load unpacked and pick the folder below.");
-  const std::wstring chromium = exe_dir() + L"\\extension\\chromium";
-  ImGui::TextColored(hexv(0x7D8BFF), "%s", utf8(chromium).c_str());
-  if (ImGui::Button("Open that folder")) open_path(chromium);
-  ImGui::Spacing();
-  ImGui::PushFont(bold_, bold_->LegacySize);
-  ImGui::TextUnformatted("Firefox");
-  ImGui::PopFont();
-  const std::wstring xpi = exe_dir() + L"\\extension\\spiderpet-firefox.xpi";
-  if (GetFileAttributesW(xpi.c_str()) != INVALID_FILE_ATTRIBUTES) {
-    ImGui::TextUnformatted("Drag this file into a Firefox window and click Add:");
-    ImGui::TextColored(hexv(0x7D8BFF), "%s", utf8(xpi).c_str());
-    if (ImGui::Button("Show the file")) open_path(exe_dir() + L"\\extension");
-  } else {
-    ImGui::TextUnformatted("Firefox only installs extensions that Mozilla has signed.");
-    ImGui::TextUnformatted("Run extension\\sign-firefox.ps1 once with your addons.mozilla.org API key; it makes "
-                           "spiderpet-firefox.xpi here. Until then, load extension\\firefox\\manifest.json from "
-                           "about:debugging > This Firefox > Load Temporary Add-on (it lasts until Firefox restarts).");
-  }
-  ImGui::Spacing();
-  ImGui::PushFont(bold_, bold_->LegacySize);
-  ImGui::TextUnformatted("Local AI");
-  ImGui::PopFont();
-  ImGui::TextUnformatted("Ollama runs the checks. The smartest installed model is used: Qwen 3.8 27B "
-                         "(qwen3.8-27b-uncensored-64k) if you have it, then qwen3:8b and smaller ones.");
+  auto head = [&](const char* t) {
+    ImGui::Spacing();
+    ImGui::PushFont(bold_, bold_->LegacySize);
+    ImGui::TextUnformatted(t);
+    ImGui::PopFont();
+  };
+  head("Drop it on any window");
+  ImGui::TextUnformatted("Press Drop the spider, then click a window: a browser page, a chat app, a PDF, a document, Settings, a game. "
+                         "Or press Ctrl+Alt+S while you are in that window. No browser extension: it reads the window through "
+                         "Windows' own screen-reader interface, the one Narrator and NVDA use, so every word is spelled exactly as written. "
+                         "When an app shows text that interface can't see (a game, a video, a picture), it reads the pixels with "
+                         "Windows' built-in text recognition.");
+  head("It knows what it has read");
+  ImGui::TextUnformatted("It walks over the part you are looking at and eats the finds there, and reads the rest out of sight. "
+                         "Silk in the margin marks what has been on screen; the line under the search says how much it has read.");
+  head("Tasks, safely");
+  ImGui::TextUnformatted("Give it a goal or a command. It uses the window's own buttons, links and boxes. Steps that could spend money, "
+                         "send or post something, sign you in or can't be undone wait for your Do it. It never types into a "
+                         "password or card box, and never solves a \"are you a robot\" check.");
+  head("Local AI");
+  ImGui::TextUnformatted("Ollama runs the checks, answers and tasks on your PC. The smartest installed model is used: Qwen 3.8 27B "
+                         "(qwen3.8-27b-uncensored-64k) if you have it.");
   ImGui::PopTextWrapPos();
 }
 

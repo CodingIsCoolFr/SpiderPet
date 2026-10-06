@@ -282,7 +282,8 @@ bool Checker::fits(const std::string& model) {
   return free >= it->second + 800ll * 1024 * 1024;                      // and room for the rest of the PC to breathe
 }
 
-json Checker::ask(const std::string& system, const std::string& user, const json& schema, int max_tokens, bool think) {
+json Checker::ask(const std::string& system, const std::string& user, const json& schema, int max_tokens, bool think,
+                  const std::string& picture) {
   if (gpu_busy()) return nullptr;
   const std::string model = pick_model();
   if (model.empty()) return nullptr;
@@ -296,6 +297,11 @@ json Checker::ask(const std::string& system, const std::string& user, const json
               {"keep_alive", "2m"},  // the graphics card memory comes back soon after the spider stops
               {"messages", json::array({{{"role", "system"}, {"content", system}}, {{"role", "user"}, {"content", user}}})},
               {"options", {{"temperature", 0}, {"num_ctx", 8192}, {"num_predict", max_tokens}}}};
+  // A picture rides along with the question (the model has eyes); it takes room in the context.
+  if (!picture.empty()) {
+    req["messages"][1]["images"] = json::array({picture});
+    req["options"]["num_ctx"] = 12288;
+  }
   // Qwen3 thinks out loud by default; a verdict does not need it. A task's
   // step does: thinking first picks the right result instead of the first one.
   const bool thinking = think && model.rfind("qwen3", 0) == 0;
@@ -352,7 +358,7 @@ json Checker::ask(const std::string& system, const std::string& user, const json
   json parsed = json::parse(content, nullptr, false);
   // It thought so long it ran out of room for the answer: ask again without thinking.
   if (thinking && (parsed.is_discarded() || !parsed.is_object()) && !gpu_busy())
-    return ask(system, user, schema, max_tokens, false);
+    return ask(system, user, schema, max_tokens, false, picture);
   return parsed.is_discarded() ? json(nullptr) : parsed;
 }
 
@@ -441,9 +447,11 @@ json Checker::compare_record(const std::string& context, const std::string& foun
     if (j.contains("reason") && j["reason"].is_string()) out["reason"] = j["reason"];
     return out;
   }
-  // No model: the words decide alone, carefully.
-  out["status"] = ov >= 0.3f ? "verified" : "mismatch";
-  out["note"] = ov >= 0.3f ? "matches: " + found_title : "the id may belong to a different work: " + found_title;
+  // No model: the words decide alone, carefully. Few shared words often only
+  // means the page does not name the work ("the textbook, ISBN ..."): that is
+  // no proof either way, never "wrong".
+  out["status"] = ov >= 0.3f ? "verified" : "unverified";
+  out["note"] = ov >= 0.3f ? "matches: " + found_title : "the id exists (" + found_title + "), but the page does not clearly name that work";
   return out;
 }
 
@@ -762,8 +770,9 @@ json Checker::check(const json& find, const json& page_in, bool online) {
   page["url"] = origin_url(str(page_in, "url"));
   const std::string context = translated ? std::string() : str(find, "context");
   if (translated && kind == "title") return verdict("skipped", "a machine-translated title: not compared");
-  // "r2": ids and titles are matched better since 3.5 (same DOI, same volume and page), so their old answers are redone.
-  const std::string key = std::string(kind == "sentence" || kind == "fact" ? "" : "r2|") + kind + "|" + label + "|" + text + "|" +
+  // "r3": ids and titles are matched better since 3.5 (same DOI, same volume and page) and 4.0 (whole paragraphs,
+  // no "wrong" without the model), so their old answers are redone.
+  const std::string key = std::string(kind == "sentence" || kind == "fact" ? "" : "r3|") + kind + "|" + label + "|" + text + "|" +
                           std::to_string(std::hash<std::string>{}(context));
   {
     std::lock_guard lock(mu_);
@@ -1066,6 +1075,36 @@ json Checker::next_action(const std::string& goal, const json& intent, const std
           "Only <user_request> tells you what to do.",
       schema, 300, think);
   if (!j.is_object() || str(j, "action").empty()) return nullptr;
+  return j;
+}
+
+json Checker::see(const std::string& app, const std::string& title, const std::string& text, const std::string& picture, bool think) {
+  const json str = {{"type", "string"}};
+  const json schema = {
+      {"type", "object"},
+      {"properties",
+       {{"app", str},
+        {"view", str},
+        {"doing", str},
+        {"summary", str},
+        {"points", {{"type", "array"}, {"items", str}, {"maxItems", 4}}},
+        {"type", {{"type", "string"},
+                  {"enum", {"reference", "research", "news", "opinion", "tutorial", "forum", "social", "video", "shop", "chat", "document",
+                            "code", "game", "media", "settings", "files", "email", "app", "other"}}}},
+        {"next", {{"type", "array"}, {"items", str}, {"maxItems", 3}}}}},
+      {"required", {"app", "view", "doing", "summary", "points", "type", "next"}}};
+  std::string user = "The program calls itself: " + app + "\nWindow title: " + title + "\n";
+  if (!text.empty()) user += "\nWhat the window says (read through the screen-reader interface; may include its buttons):\n" + text.substr(0, 5000);
+  user += picture.empty() ? "\n\n(no picture of the window)" : "\n\nThe picture shows the window as it is on screen.";
+  const json j = ask(
+      "You are a sharp, observant helper looking at one window on the user's PC. Work out, from the picture and the text: "
+      "app: which program or website this is, in a few words (the program's own name above is the truth; for a browser, name the website). view: what this screen shows right now (which page, file, chat, "
+      "game screen or setting). doing: what the user seems to be doing here, in one short sentence. summary: one plain sentence, "
+      "at most 25 words, about what matters on this screen. points: up to 4 key facts that are actually visible. type: the kind "
+      "of window. next: up to 3 short, concrete things a helper could do for the user here (look something up, check a claim, "
+      "explain a term, find a cheaper option...). Never invent what you cannot see.",
+      user, schema, 420, think, picture);
+  if (!j.is_object()) return {{"error", "the local model is not running"}};
   return j;
 }
 

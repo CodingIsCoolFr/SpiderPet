@@ -3,40 +3,51 @@
 </p>
 
 <p align="center">
-  <img alt="Firefox, Brave, Chrome, Edge" src="https://img.shields.io/badge/browser-Firefox%20%7C%20Brave%20%7C%20Chrome%20%7C%20Edge-0B0C14?style=flat-square&logoColor=7FD6FF">
+  <img alt="Any window" src="https://img.shields.io/badge/works%20on-any%20window-0B0C14?style=flat-square&logoColor=7FD6FF">
   <img alt="Windows 10/11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0B0C14?style=flat-square&logo=windows&logoColor=7FD6FF">
   <img alt="Local AI" src="https://img.shields.io/badge/local%20AI-Qwen%203.8-0B0C14?style=flat-square&logoColor=93F5AE">
   <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-0B0C14?style=flat-square">
 </p>
 
 <p align="center">
-  <b>Type what you are looking for, and a spider drops onto the page you have open and hunts for it. It walks<br>
-  across the text, harvests the DOIs, ISBNs, paper ids, titles, links and key facts, restyles them right in<br>
-  the page, and checks every one against a real source.</b>
+  <b>Drop a spider on any window: a web page, a chat, a document, Settings, a game. It works out what the app is and<br>
+  what is on it, walks across the text, harvests the DOIs, ISBNs, paper ids, titles, links and key facts, re-sets them<br>
+  in place, checks every one against a real source, and does tasks for you with that window's own buttons.</b>
 </p>
 
 <p align="center">
-  <img src="docs/media/page.png" alt="The spider hunting for 'silk' on the Wikipedia Spider page: every match lit up, the sentence it is reading underlined, its name and thought in a cloud" width="820">
+  <img src="docs/media/page.png" alt="The spider on a web page: each DOI, ISBN, id and title re-set on a navy tag that fits its own words, a check line under each find, and verified, no proof and not found labels in the margins" width="860"><br>
+  <sub>every find on a tag that fits its own words, a check line under it, the verdict in the margin: never on top of the text</sub>
 </p>
 
 ---
 
+## What's new in 4.0: no extension, any window
+
+SpiderPet used to need a browser extension. Now it is one program that reads **any** window by itself:
+
+- **Drop it anywhere.** Press **Drop the spider** and click a window, or press **Ctrl+Alt+S** in the window you are using. Browsers, chat apps, editors, PDF readers, File Explorer, Settings.
+
+  <img src="docs/media/window.png" alt="The spider in a Notepad window: the DOI re-set in green code, its thought cloud says doi: 10.1038/nature12373" width="620">
+
+- **It reads like a screen reader.** Windows' own accessibility interface (the one Narrator and NVDA use) gives the real text of the window, where every piece sits, and every button, link and box. Nothing is guessed from pixels when the text is there.
+- **It reads pixels when it has to.** A game, a video or a picture shows text that interface can't see; Windows' built-in text recognition reads it then.
+- **It looks with the AI's own eyes.** The local model gets a picture of the window with its text and buttons, and says which app it is, what this screen shows, what you seem to be doing, and what it could do for you there.
+- **It knows what it has read.** It reads every word, link and button label in the window, not only what it highlights. It works on the part you are looking at and reads the rest out of sight. Silk in the margin marks what has been on screen; the app shows how much of the window it has read and how many finds it has eaten.
+
 ## What it does
 
-- **Reads the real page.** It runs inside the browser and reads the page itself, so every DOI, title and sentence is spelled exactly as written. Nothing is guessed from pixels. Hidden text, menus, cookie banners and ads are left out.
-- **Hunts for what you ask.** Type what you are looking for in the SpiderPet app. The spider drops onto the page you have open, every match on the page lights up at once, and it goes from match to match down the page. The local AI adds synonyms a moment later.
-- **Answers questions about the page.** Type a question instead, like *what's this page about?* or *what do spiders eat?*, and the app answers it from the page you have open, quoting the page. When the AI can't run, you still get a quick answer built from the page's own sentences.
-- **Does tasks for you, from any page.** Give it a goal in plain words: *find me spider plushies on amazon* (from a new tab), *translate this page to french*, *play me a cat video on youtube*, *find the cheapest plush toy in the shop and add it to the cart*, *go to wikipedia and find out how many eyes a jumping spider has*. Anything typed on a new tab is a task; on a web page, a sentence that says what to do is a task, while a few words (*jumping spider eyes*) are still hunted on the page. Your local AI first works out what you really mean (a video *about* cats, not a song with "cat" in its name) and writes a short plan from the page you are on, using that page's own buttons and menus, which the app shows with the step it is on. Then it thinks before every step: it looks at the page, judges whether its last step worked, keeps notes, compares the results (each "Add to cart" or "Play" button comes with the item it belongs to), and picks the next step, until the page shows the goal is done. When the plan hits a dead end, it makes a new one. Thinking makes a step take 10 to 30 seconds; turn it off in Settings for speed. A video has to really be playing before it says done. Answers stay in the app until you close it. Short commands work too: *click Sign in*, *type cats into the search box and press enter*, *go to wikipedia.org*, *scroll down*, *go back*.
-- **Hands over to you when it should.** When a task needs a password, a payment or a choice only you can make, the spider stops and asks in the app. Type your answer, or do it on the page (your browser's password manager works as usual), and press **Continue**. It never types passwords or card numbers itself: a web page could trick an AI into typing them somewhere else, so they stay with you.
-- **Asks before anything risky.** Safe steps (scrolling, opening links, searching, typing into a box) just happen. Steps that could spend money, send or post something, sign you in or up, save changes, or can't be undone wait for your **Do it**. That check runs in the page, not in the AI, so no page text can talk it out of it. Want to approve every step? Settings → *Tasks: ask me before every step*. While a task runs, fact-checking pauses so the task gets the AI first.
-- **Gets past popups.** Cookie banners, sign-up walls, newsletter popups and dark backdrops that cover the page are tucked out of sight, and a locked page can scroll again. Unclear cases go to your local AI. The spider never clicks Accept on a popup; stop it and everything comes back.
-- **Walks like a spider.** Eight jointed legs, a magenta lasso, bursts of speed, a thought cloud with its name, silk between the things it ate. Without a search it reads the key sentences of the page with a sweep. It never scrolls your page: it works on the part you are looking at while the rest of the page is read out of sight.
-- **One control center.** Everything is in the SpiderPet app: the search, Start/Stop spider, what it found on the page you are looking at, and the library. The browser needs no menus.
-- **Restyles the real text.** Like the clip that inspired it: DOIs turn into green code, ISBNs into big blue code, ids into tags, titles into salmon serif, links get a frame. The page itself changes; nothing is painted over it.
-- **Checks everything.** Each find gets a badge in the page: **✓ verified**, **⚠ wrong**, **✗ not found**, **? no proof found**, **opinion** or **ad**. Hover for the reason and the source; click to open the source. A reference counts as verified when the record agrees on its DOI or on volume, page and year, even if the citation names it differently. Pages seen through Google Translate are checked as their original site, and their machine-translated titles are not compared.
-- **Keeps a library.** The SpiderPet app keeps every find from every browser, with its check, its source and the page it came from. Search it, filter it, save it as JSON or CSV. **Forget** buttons clear one page or everything, including the remembered checks.
-- **Reads any site and any language.** Sites built without paragraphs (X, Reddit, Pinterest) are read too, and the app shows Japanese, Chinese, Korean, Indian scripts and emoji.
-- **Stays out of the way.** It draws at most 60 frames a second and re-reads a page only when the page really changed. Before it loads the AI it checks free graphics memory: when a game or VRChat has taken it, the AI waits instead of making your PC stutter, and ids and titles are still checked online.
+- **Hunts for what you ask.** Type what you are looking for. Every match lights up, and the spider goes from match to match.
+- **Answers questions about the window.** *What's this about?*, *what does this error mean?*: the answer comes from what the window shows, with a quote.
+- **Does tasks, in any window.** Give it a goal or a command: *search the site for silk*, *click Sign in*, *type cats into the search box and press enter*, *go to wikipedia.org*. It plans, looks at the window before every step, and uses that window's own buttons, links and boxes.
+- **Asks before anything risky.** Steps that could spend money, send or post something, sign you in or up, or can't be undone wait for your **Do it**. Enter waits too, since it can send a form. It never types into a password or card box, and never answers an "are you a robot?" check.
+- **Walks like a spider.** Eight jointed legs, coral with mint joints, a magenta lasso, a scalloped thought cloud with its thoughts typed out.
+- **Re-sets what it eats.** DOIs in green code, ISBNs in bold blue code, ids on a blue chip, titles in salmon serif, each on a navy tag exactly the size of its own words, so it never covers the words around it. Links get a frame. It paints over the window; the window itself is not changed.
+- **Shows every check where you can read it.** A line under each checked find, like a spell checker's: straight green when verified, wavy amber or red when wrong or not found, dotted grey for no proof. The verdict's label goes in the margin beside the paragraph, never on top of text, with a thin thread back to the find when it had to move.
+- **Never draws in the wrong place.** A tracker follows the window and its scrolling about 120 times a second. While the window or its content moves, the marks step aside, and come back once they are measured where they are now.
+- **Keeps a library** of every find from every window, with its check and source. Search it, filter it, save it as JSON or CSV.
+- **Stays with its window.** Click somewhere else and the spider stays on its window, still working; windows you put on top cover it like any window. Screen shares and recordings show it (Settings can hide it); when it takes its own picture of a window it steps out of it, so it never reads itself.
+- **Stays out of the way.** Before it loads the AI it checks free graphics memory: when a game has taken it, the AI waits instead of making your PC stutter.
 
 ## How the checking works
 
@@ -50,54 +61,51 @@ The local AI is the judge, never the source. It only compares a find with a reco
 | Citation title | Crossref | (shown as verified when a published work has that title) |
 | Fact in a sentence | Wikipedia, chosen by the AI | the evidence says something incompatible |
 
-The AI also sorts sentences into facts, opinions and advertising, writes a short summary of each page with its key points, and ranks finds against what you typed in **What are you looking for?**
+**No proof** is not **wrong**: an id that is real, on a page that does not name the work ("the textbook, ISBN ..."), or a check the AI could not do because a game had the graphics card, says *no proof found*. Only evidence makes a find wrong.
 
-Only the find leaves your PC (an id, a title or a few search words), never the page. Turn **Online checks** off in the app and nothing leaves at all.
+Only the find leaves your PC (an id, a title or a few search words), never the window. Turn **Online checks** off in the app and nothing leaves at all.
 
 <p align="center">
-  <img src="docs/media/app.png" alt="The SpiderPet app: the search, Start/Stop spider, the tab you are on, and the finds that match with their checks" width="420"><br>
-  <sub>the SpiderPet app: the search, the spider's switch, and every find with its check</sub>
+  <img src="docs/media/app.png" alt="The SpiderPet app on the This window tab: which window the spider is on, how much it has read and eaten, and every find with its check and source" width="420"><br>
+  <sub>the app: which window the spider is on, how much it has read and eaten, and every find with its check and source</sub>
 </p>
 
 ## Install
 
-1. Install [Ollama](https://ollama.com) and a model. The smartest one SpiderPet knows is Qwen 3.8 27B (`qwen3.8-27b-uncensored-64k`, about 13 GB, runs at ~35 tokens/s on an RTX 4080); `qwen3:8b` works on smaller cards.
-2. Download **SpiderPet.exe** and **SpiderHost.exe** from the [latest release](https://github.com/CodingIsCoolFr/SpiderPet/releases/latest) into one folder and run SpiderPet.exe once. It tells your browsers where it is.
-3. Add the extension:
-   - **Brave, Chrome, Edge:** unzip `spiderpet-chromium.zip`, open `brave://extensions` (or `chrome://`, `edge://`), turn on Developer mode, click **Load unpacked** and pick the folder.
-   - **Firefox:** install SpiderPet from [addons.mozilla.org](https://addons.mozilla.org) once it is listed there (`extension\sign-firefox.ps1` sends it to Mozilla's store). Before that: unzip `spiderpet-firefox-unsigned.zip`, open `about:debugging` → This Firefox → **Load Temporary Add-on**, and pick its `manifest.json` (it lasts until Firefox restarts).
-4. Open a page. In the SpiderPet window, type what you are looking for: the spider drops onto that page and hunts for it. Or press **Start spider**. The spider button in the browser toolbar (**Alt + Shift + S**) does the same.
+1. Install [Ollama](https://ollama.com) and a model with vision. The smartest one SpiderPet knows is Qwen 3.8 27B (`qwen3.8-27b-uncensored-64k`, about 13 GB, ~35 tokens/s on an RTX 4080).
+2. Download **SpiderPet.exe** from the [latest release](https://github.com/CodingIsCoolFr/SpiderPet/releases/latest) and run it.
+3. Press **Drop the spider** and click any window, or press **Ctrl+Alt+S** in it.
 
-The app sits in the tray. Close its window and it keeps working; quit from the tray icon. The browser connects by itself whenever the app is running.
+The app sits in the tray. Close its window and the spider keeps working; quit from the tray icon.
+
+**Coming from 3.x?** The browser extension and `SpiderHost.exe` are no longer used: remove the extension from your browser and delete `SpiderHost.exe`. Your library and settings carry over.
 
 ## Build from source
 
-Needs Visual Studio 2022 (C++), CMake 3.21+ and [vcpkg](https://vcpkg.io) (set `VCPKG_ROOT`). The libraries are listed in `vcpkg.json` (ImGui with 32-bit characters for emoji, nlohmann/json); the first build installs them into `build\`.
+Needs Visual Studio 2022 (C++ with the Windows SDK), CMake 3.21+ and [vcpkg](https://vcpkg.io) (set `VCPKG_ROOT`).
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-That builds `SpiderPet.exe`, `SpiderHost.exe` and the extension (`extension\chromium`, `extension\firefox`).
-
 ```
-extension/src   the spider in the page: reading, walking, hunting, restyling, badges
-src/app         SpiderPet.exe (window, tray, library), SpiderHost.exe (the browser's bridge)
-src/mind        the checker: Crossref, OpenLibrary, PubMed, arXiv, Wikipedia, and the local model
-src/core        small helpers
+src/eyes    reading any window: UI Automation, screenshots, Windows OCR (and SpiderSee.exe, a test tool that prints what it sees)
+src/crawl   the crawler (harvesting, the spider's walk, tasks) and the stage (the see-through layer it is drawn on)
+src/app     SpiderPet.exe: window, tray, library, the jobs
+src/mind    the checker: Crossref, OpenLibrary, PubMed, arXiv, Wikipedia, and the local model (text and pictures)
+src/core    small helpers
 ```
-
-The browser starts SpiderHost.exe (native messaging); it relays everything over a private named pipe to SpiderPet.exe, which owns the library, the checks and the controls. When the app is not running, SpiderHost waits for it, so the app can send the spider out the moment you start it.
 
 ## Privacy
 
-The extension sends what it harvests to SpiderPet.exe on your own PC. SpiderPet.exe sends each find (never the page) to the public sources above when Online checks are on, and talks to Ollama on `127.0.0.1`. The library stays in `Documents\SpiderPet`, settings in `%APPDATA%\SpiderPet`.
+Everything runs on your PC. The window's text and picture go only to Ollama on `127.0.0.1`. Each find (never the window) goes to the public sources above when Online checks are on. The library stays in `Documents\SpiderPet`, settings in `%APPDATA%\SpiderPet`.
 
 ## Credits
 
-- The task agent borrows ideas from [Nanobrowser](https://github.com/nanobrowser/nanobrowser) (Apache-2.0): judging the last step and keeping notes each step, finding buttons by their hand pointer, marking new and covered elements, and fencing page text off as untrusted. The code here is SpiderPet's own.
+- How it reads windows borrows rules from three MIT projects that read Windows apps for AI agents: [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) (what counts as clickable, the cycle guard, the element budget), [Cua](https://github.com/trycua/cua)'s Windows driver (a numbered list of what is on screen) and [Hermes Agent](https://github.com/NousResearch/hermes-agent) (a picture plus numbered elements for the model). The code here is SpiderPet's own.
+- Drawing over other apps borrows from [Wingman](https://github.com/Raaif-Yousuf/Wingman/issues/325) (hide labels while the window moves, labels beside the text, never on it), [Hypothesis](https://web.hypothes.is/blog/fuzzy-anchoring/) (the text around a quote picks the right copy of it) and greedy label placement as chart and map labelers do it ([Kittivorawong, Moritz, Wongsuphasawat and Heer](https://idl.cs.washington.edu/files/2021-FastLabels-VIS.pdf)).
+- The task agent borrows ideas from [Nanobrowser](https://github.com/nanobrowser/nanobrowser) (Apache-2.0): judging the last step and keeping notes each step, marking new elements, and treating window text as untrusted.
 - Inspired by the node-and-line spider in [this clip by @Ufosoldier](https://x.com/Ufosoldier/status/2105902567846756439).
-- Page in the screenshots: the Wikipedia article [Spider](https://en.wikipedia.org/wiki/Spider), CC BY-SA 4.0.
 - [Dear ImGui](https://github.com/ocornut/imgui) Win32/DX11 backends (MIT), [nlohmann/json](https://github.com/nlohmann/json) (MIT).
 - Lookups: [Crossref](https://www.crossref.org), [OpenLibrary](https://openlibrary.org), [Google Books](https://books.google.com), [NCBI E-utilities](https://www.ncbi.nlm.nih.gov/books/NBK25501/), [arXiv](https://arxiv.org), [Wikipedia](https://www.wikipedia.org).
 

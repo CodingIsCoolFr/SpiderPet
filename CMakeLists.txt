@@ -6,7 +6,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
 endif()
 set(VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "vcpkg triplet")
 
-project(SpiderPet VERSION 3.0.0 LANGUAGES CXX)
+project(SpiderPet VERSION 4.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,12 +18,11 @@ endif()
 find_package(imgui CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 
-# The checker and the browser connection, shared by the app and the relay.
+# The checker and the library.
 add_library(spidercore STATIC
   src/core/util.cpp
   src/mind/net.cpp
   src/mind/check.cpp
-  src/app/bridge.cpp
   src/app/library.cpp
 )
 target_include_directories(spidercore PUBLIC src)
@@ -35,12 +34,23 @@ target_link_libraries(spidercore PUBLIC nlohmann_json::nlohmann_json winhttp she
 add_executable(SpiderPet WIN32
   src/app/main.cpp
   src/app/spiderpet.rc
+  src/crawl/crawler.cpp
+  src/crawl/stage.cpp
+  src/crawl/spider.cpp
   third_party/imgui_backends/imgui_impl_win32.cpp
   third_party/imgui_backends/imgui_impl_dx11.cpp
 )
 target_include_directories(SpiderPet PRIVATE third_party/imgui_backends)
-target_link_libraries(SpiderPet PRIVATE spidercore imgui::imgui d3d11 dxgi dwmapi d3dcompiler dxguid)
+target_link_libraries(SpiderPet PRIVATE spidercore spidereyes imgui::imgui d3d11 dxgi dwmapi d3dcompiler dxguid d2d1 dcomp dwrite)
 
-# SpiderHost.exe: started by the browser, relays the extension to the app.
-add_executable(SpiderHost src/app/host.cpp)
-target_link_libraries(SpiderHost PRIVATE spidercore)
+# The spider's eyes: reads any window through UI Automation, OCR and screenshots.
+add_library(spidereyes STATIC
+  src/eyes/eyes.cpp
+  src/eyes/shot.cpp
+)
+target_include_directories(spidereyes PUBLIC src)
+target_link_libraries(spidereyes PUBLIC uiautomationcore oleaut32 ole32 version windowscodecs windowsapp dwmapi)
+
+# SpiderSee.exe: a test tool that prints what the eyes see in a window.
+add_executable(SpiderSee src/eyes/see_test.cpp src/core/util.cpp)
+target_link_libraries(SpiderSee PRIVATE spidereyes shell32)
