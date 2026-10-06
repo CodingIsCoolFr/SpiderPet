@@ -50,13 +50,17 @@ class Checker {
   // the user means by `want` ("Click the first video"). -> {index, why}; index -1
   // when none fits. Null without the model. The user still confirms before anything happens.
   nlohmann::json pick(const std::string& want, const nlohmann::json& items);
-  // The next step toward a goal, from a look at the page ({url, title, text,
-  // scroll, items: [{i, kind, label, href, value, inView, search}]}) and what was
-  // done so far. -> {action: click|type|scroll|goto|back|done|ask, index, text,
-  // enter, url, dir, say}. Null without the model.
-  // think: the model reasons before each step (smarter, about 3x slower).
+  // The next step toward a goal, from a look at the page ({url, title, text (on
+  // screen), where ("screen 2 of 5"), outline (headings), hits (where the goal's
+  // words are), items: [{i, kind, label, href, value, inView, search}]}) and
+  // what was done so far. -> {action: click|type|scroll|goto|back|find|search|
+  // play|pause|key|done|ask, index, text, enter, url, site, dir, say}. Null
+  // without the model.
+  // think: the model reasons first (smarter, about 3x slower).
+  // picture: the window as base64 JPEG with the items' numbers drawn on it.
   nlohmann::json next_action(const std::string& goal, const nlohmann::json& intent, const std::string& memory,
-                             const nlohmann::json& history, const nlohmann::json& snap, bool think = false);
+                             const nlohmann::json& history, const nlohmann::json& snap, bool think = false,
+                             const std::string& picture = "");
   // What a goal really asks for, before the first step: {intent, done_when,
   // query, media}. Null without the model.
   // page: what the person has open right now (title, address, what can be clicked), so the plan uses it.

@@ -63,9 +63,13 @@ int wmain(int argc, wchar_t** argv) {
   auto items = e.items(60);
   printf("ITEMS %zu (%.2fs)\n", items.size(), now_seconds() - t3);
   for (auto& it : items)
-    printf("  %d %s%s%s \"%.60s\" %s%s%s\n", it.i, it.kind.c_str(), it.in_view ? "" : " (off)", it.secret ? " SECRET" : "", it.label.c_str(),
+    printf("  %d %s%s%s \"%.60s\" %s%s%s%s\n", it.i, it.kind.c_str(), it.in_view ? "" : " (off)", it.secret ? " SECRET" : "", it.label.c_str(),
            it.value.empty() ? "" : ("=" + it.value).c_str(), it.row.empty() ? "" : (" row: " + it.row.substr(0, 60)).c_str(),
-           it.href.empty() ? "" : (" -> " + it.href.substr(0, 50)).c_str());
+           it.href.empty() ? "" : (" -> " + it.href.substr(0, 50)).c_str(), it.dialog >= 0 ? (" [pop-up " + std::to_string(it.dialog) + "]").c_str() : "");
+  auto dl = e.dialogs();
+  printf("POP-UPS %zu\n", dl.size());
+  for (size_t i = 0; i < dl.size(); ++i)
+    printf("  %zu \"%.40s\" (%.0f,%.0f %.0fx%.0f) %.160s\n", i, dl[i].label.c_str(), dl[i].r.x, dl[i].r.y, dl[i].r.w, dl[i].r.h, dl[i].text.c_str());
   if (argc > 2 && std::wstring(argv[2]) == L"ocr") {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     double t4 = now_seconds();

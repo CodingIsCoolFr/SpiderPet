@@ -15,5 +15,6 @@ uint32_t fnv1a(std::wstring_view s);
 std::wstring lower(std::wstring_view s);
 std::wstring trim(std::wstring_view s);
 void debug_log(const std::string& line);  // %APPDATA%\SpiderPet\debug.log when SPIDERPET_LOG=1
+void task_log(const std::string& line);   // %APPDATA%\SpiderPet\tasks.log, always: what each task step did (kept small)
 
 }  // namespace sp

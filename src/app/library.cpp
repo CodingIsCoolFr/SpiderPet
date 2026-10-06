@@ -51,7 +51,7 @@ std::string csv(const std::string& v) {
 json Settings::to_json() const {
   return {{"goal", goal},          {"online", online},       {"auto_check", auto_check},
           {"check_sentences", check_sentences}, {"crawl", crawl}, {"popups", popups}, {"ask_every_step", ask_every_step}, {"think_tasks", think_tasks},
-          {"show_in_shares", show_in_shares}, {"model", model}};
+          {"show_in_shares", show_in_shares}, {"close_popups", close_popups}, {"model", model}};
 }
 
 void Settings::from_json(const json& j) {
@@ -65,6 +65,7 @@ void Settings::from_json(const json& j) {
   ask_every_step = j.value("ask_every_step", ask_every_step);
   think_tasks = j.value("think_tasks", think_tasks);
   show_in_shares = j.value("show_in_shares", show_in_shares);
+  close_popups = j.value("close_popups", close_popups);
   model = j.value("model", model);
 }
 

@@ -136,6 +136,65 @@ std::string jpeg_base64(const Pixels& px, int max_side, int quality) {
   return out;
 }
 
+void draw_marks(Pixels& px, const std::vector<std::pair<int, RECT>>& marks) {
+  if (!px.ok() || marks.empty()) return;
+  BITMAPINFO bi{};
+  bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+  bi.bmiHeader.biWidth = px.w;
+  bi.bmiHeader.biHeight = -px.h;  // top-down
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+  void* bits = nullptr;
+  HDC mem = CreateCompatibleDC(nullptr);
+  HBITMAP bmp = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+  if (!mem || !bmp) {
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
+    return;
+  }
+  memcpy(bits, px.bgra.data(), px.bgra.size());
+  HGDIOBJ old_bmp = SelectObject(mem, bmp);
+  // Big enough to read after the picture is scaled down for the model.
+  int fh = std::max(14, std::max(px.w, px.h) / 70);
+  HFONT font = CreateFontW(-fh, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                           ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+  HGDIOBJ old_font = SelectObject(mem, font);
+  SetBkMode(mem, TRANSPARENT);
+  SetTextColor(mem, RGB(255, 255, 255));
+  static const COLORREF colors[] = {RGB(230, 40, 60), RGB(20, 120, 230), RGB(230, 120, 0), RGB(140, 40, 220), RGB(0, 150, 90), RGB(210, 0, 150)};
+  for (auto& [i, r] : marks) {
+    RECT b{r.left - px.on_screen.left, r.top - px.on_screen.top, r.right - px.on_screen.left, r.bottom - px.on_screen.top};
+    if (b.right <= 0 || b.bottom <= 0 || b.left >= px.w || b.top >= px.h || b.right <= b.left || b.bottom <= b.top) continue;
+    COLORREF c = colors[size_t(std::abs(i)) % 6];
+    HPEN pen = CreatePen(PS_SOLID, 2, c);
+    HGDIOBJ old_pen = SelectObject(mem, pen);
+    HGDIOBJ old_brush = SelectObject(mem, GetStockObject(NULL_BRUSH));
+    Rectangle(mem, b.left, b.top, b.right, b.bottom);
+    SelectObject(mem, old_brush);
+    SelectObject(mem, old_pen);
+    DeleteObject(pen);
+    // The number on a tab at its top left corner (above it when there is room).
+    std::wstring t = std::to_wstring(i);
+    SIZE sz{};
+    GetTextExtentPoint32W(mem, t.c_str(), int(t.size()), &sz);
+    RECT tab{b.left, b.top - sz.cy - 1, b.left + sz.cx + 6, b.top - 1};
+    if (tab.top < 0) tab = RECT{b.left, b.top, b.left + sz.cx + 6, b.top + sz.cy};
+    HBRUSH fillb = CreateSolidBrush(c);
+    FillRect(mem, &tab, fillb);
+    DeleteObject(fillb);
+    TextOutW(mem, tab.left + 3, tab.top, t.c_str(), int(t.size()));
+  }
+  GdiFlush();
+  memcpy(px.bgra.data(), bits, px.bgra.size());
+  for (size_t k = 3; k < px.bgra.size(); k += 4) px.bgra[k] = 255;  // GDI leaves the alpha of what it drew at 0
+  SelectObject(mem, old_font);
+  DeleteObject(font);
+  SelectObject(mem, old_bmp);
+  DeleteObject(bmp);
+  DeleteDC(mem);
+}
+
 std::vector<OcrLine> read_pixels(const Pixels& px) {
   std::vector<OcrLine> out;
   if (!px.ok()) return out;

@@ -27,6 +27,10 @@ Pixels grab(HWND h, const RECT* region = nullptr);
 void set_grab_guard(void (*guard)(bool hide));
 // JPEG, longest side at most max_side, base64 (what Ollama takes as an image).
 std::string jpeg_base64(const Pixels& px, int max_side = 1280, int quality = 82);
+// Numbered boxes drawn on the picture ("set-of-marks", as WebVoyager,
+// Magentic-One and browser-use show pages to a model): the model sees a thing
+// and names it by its number. Boxes are in screen pixels.
+void draw_marks(Pixels& px, const std::vector<std::pair<int, RECT>>& marks);
 
 struct OcrLine {
   std::string text;

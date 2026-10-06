@@ -85,6 +85,22 @@ std::wstring trim(std::wstring_view s) {
   return std::wstring(s);
 }
 
+void task_log(const std::string& line) {
+  static std::mutex mu;
+  std::lock_guard lock(mu);
+  static const std::wstring path = app_data_dir() + L"\\tasks.log";
+  // Kept small: the newest ~256 KB, the one before as tasks.old.log.
+  WIN32_FILE_ATTRIBUTE_DATA fa{};
+  if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) && fa.nFileSizeLow > 256 * 1024)
+    MoveFileExW(path.c_str(), (app_data_dir() + L"\\tasks.old.log").c_str(), MOVEFILE_REPLACE_EXISTING);
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, path.c_str(), L"a") != 0 || !f) return;
+  SYSTEMTIME t{};
+  GetLocalTime(&t);
+  std::fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d %s\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, line.c_str());
+  std::fclose(f);
+}
+
 void debug_log(const std::string& line) {
   static const bool on = [] {
     const char* v = std::getenv("SPIDERPET_LOG");

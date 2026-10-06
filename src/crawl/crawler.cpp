@@ -139,7 +139,7 @@ const std::map<std::string, double> kKindPrio = {{"doi", 3}, {"isbn", 3}, {"id",
 
 // Words that say a click may cost money, send something, or can't be undone (the extension's own list).
 const std::regex kRisky(
-    R"(\b(buy|pay|purchase|order|checkout|check out|subscribe|unsubscribe|delete|remove|send|publish|submit|confirm|transfer|donate|sign up|register|log ?out|sign out|commit|merge|save changes|deactivate|close account|uninstall|format|empty recycle)\b|^(post|reply|tweet|share|save|update|apply)\b)",
+    R"(\b(buy|pay|purchase|order|checkout|check out|subscribe|unsubscribe|delete|remove|send|publish|submit|confirm|transfer|donate|sign up|register|log ?out|sign out|commit|merge|save changes|deactivate|close account|uninstall|format|empty recycle|accept|agree|consent|allow all)\b|^(post|reply|tweet|share|save|update|apply)\b)",
     std::regex::icase);
 
 struct Find {
@@ -197,6 +197,12 @@ struct Crawler::Impl {
   unsigned ocr_layout = 0;
   double last_look = -100, last_locate = -100, last_say = -100, last_ocr = -100, attached_at = 0;
   unsigned long long located_ms = 0;  // the last measuring of where finds are that nothing moved during
+  // Pop-ups (setting "Close pop-ups that get in the way").
+  bool close_popups = true;
+  std::set<std::string> popups_done;  // each pop-up is handled once
+  double next_popups = 0, last_snap_at = -1000;
+  int popup_looks = 0;
+  std::vector<eyes::Dialog> snap_dialogs;  // the pop-ups of the last look for a task
   unsigned spans_layout = ~0u;        // eyes layout of `spans` (other: out of date)
   std::string last_tree_hash;
   unsigned last_gen = 0;
@@ -306,6 +312,14 @@ struct Crawler::Impl {
         if (still && (t - last_locate > 0.7 || located_ms <= st.moved_ms)) locate(st);
         behave(t, st);
         mark_seen(st);
+        // Pop-ups, on its own; during a task the look before each step does it
+        // (the numbers of the AI's last look must not change under it).
+        if (close_popups && act.seq < 0 && t - last_snap_at > 60 && t >= next_popups) {
+          static const double after[] = {1.5, 3.5, 7, 20};  // soon after a page loads, then now and then
+          next_popups = t + after[std::min<size_t>(size_t(popup_looks), 3)];
+          ++popup_looks;
+          handle_popups();
+        }
       }
       scene.show = spider_on;
       scene.marks.clear();
@@ -325,7 +339,10 @@ struct Crawler::Impl {
         if (sp.empty()) continue;
         scene.columns.push_back(sp);
         if (how != "page" || i >= seen_block.size() || !seen_block[i]) continue;
-        bool joins = !run.empty() && sp.y >= run.y - 4 && sp.y - (run.y + run.h) < 48 && std::fabs(sp.x - run.x) < 64;
+        // Only real paragraphs: a tag, a date, a name or a button label would
+        // each get its own little dash, all over the page.
+        if (i >= blocks.size() || blocks[i].size() < 50) continue;
+        bool joins =!run.empty() && sp.y >= run.y - 4 && sp.y - (run.y + run.h) < 48 && std::fabs(sp.x - run.x) < 64;
         if (joins) {
           float bottom = std::max(run.y + run.h, sp.y + sp.h);
           run.x = std::min(run.x, sp.x);
@@ -497,6 +514,8 @@ struct Crawler::Impl {
     bool new_page = l.url != url;
     if (new_page) {
       url = l.url;
+      popup_looks = 0;
+      next_popups = now_seconds() + 1.5;
       finds.clear();
       by_id.clear();
       eating.clear();
@@ -1025,7 +1044,10 @@ struct Crawler::Impl {
     const std::string type = jstr(m, "type");
     if (type == "state" || type == "settings") {
       const json st = m.value("settings", json::object());
-      if (st.is_object()) scene.hide_in_shares = !st.value("show_in_shares", true);
+      if (st.is_object()) {
+        scene.hide_in_shares = !st.value("show_in_shares", true);
+        close_popups = st.value("close_popups", true);
+      }
       if (type == "state") set_goal(jstr(m, "goal"), m.value("terms", json::array()));
     } else if (type == "goal" || type == "hunt") {
       set_goal(jstr(m, "goal"), m.value("terms", json::array()));
@@ -1060,7 +1082,7 @@ struct Crawler::Impl {
       spider_on = m.value("on", true);
       if (attached) tell({{"type", "tab"}, {"tabId", 1}, {"url", url}, {"title", title}, {"web", true}, {"spider", spider_on}});
     } else if (type == "snap") {
-      tell({{"type", "snap"}, {"seq", m.value("seq", -1)}, {"tabId", 1}, {"snap", snapshot()}});
+      tell({{"type", "snap"}, {"seq", m.value("seq", -1)}, {"tabId", 1}, {"snap", snapshot(m)}});
     } else if (type == "act") {
       start_act(m);
     } else if (type == "act-pick") {
@@ -1074,11 +1096,115 @@ struct Crawler::Impl {
 
   // ------------------------------------------------ tasks
 
-  // What the window offers right now, for the AI that plans a task: some of
-  // its text and a numbered list of what can be clicked or typed into.
-  json snapshot() {
+  // A pop-up handler (Playwright runs one before each action; DuckDuckGo's
+  // autoconsent and Consent-O-Matic answer cookie boxes by themselves):
+  // a cookie box gets a no (Reject all, Necessary only); a newsletter, app,
+  // notification or survey pop-up gets closed. Terms to agree to are never
+  // agreed to: the person is told (in a task the AI may propose it, and it
+  // waits for their "Do it"). A pop-up of any other kind is left alone: the
+  // person may have opened it. Each pop-up once. Returns what it did.
+  std::string handle_popups() {
+    if (!close_popups || !attached) return {};
+    static const std::regex cookie_rx(R"(\b(cookies?|consent|gdpr|tracking technologies|our partners|personali[sz]ed (ads|advertising|content)|legitimate interest)\b)",
+                                      std::regex::icase);
+    static const std::regex agree_rx(R"(\b(agree to|terms of (use|service)|accept (the|our) terms|by continuing|by clicking|end user licen[cs]e|eula)\b)",
+                                     std::regex::icase);
+    static const std::regex nag_rx(
+        R"(\b(newsletter|subscribe|sign up for|notifications?|discount|\d+ ?% off|special offer|exclusive deal|get the app|download (the|our) app|open in (the )?app|install (the|our) app|ad ?blocker|disable your ad|join (now|us|our)|become a member|survey|feedback|rate us|don't miss|limited time)\b)",
+        std::regex::icase);
+    static const std::regex no_rx(
+        R"(^\s*(reject( all)?( cookies)?|reject (optional|non-essential|additional) cookies|decline( all)?( cookies)?|decline optional cookies|deny( all)?|refuse( all)?|disagree|(use )?(only )?(strictly )?(necessary|essential|required)( cookies)?( only)?|continue without (accepting|agreeing))\s*$)",
+        std::regex::icase);
+    static const std::regex close_rx(
+        R"(^\s*(close( (dialog|popup|pop-up|this|banner|window|modal))?|x|\xC3\x97|\xE2\x9C\x95|\xE2\x9C\x96|no,? thanks?|no thank you|not now|maybe later|later|skip|dismiss|not interested|no)\s*$)",
+        std::regex::icase);
+    std::vector<eyes::Item> items = eyes.items(300);
+    std::vector<eyes::Dialog> dl = eyes.dialogs();
+    std::string page_key = url.substr(0, url.find('#'));
+    auto click = [&](const eyes::Item& it, const std::string& key, const std::string& what) -> std::string {
+      popups_done.insert(key);
+      std::string note;
+      if (!eyes.click_item(it.i, &note)) {
+        debug_log("popup: could not click \"" + it.label + "\": " + note);
+        return {};
+      }
+      debug_log("popup: " + what + " (\"" + it.label + "\") on " + page_key);
+      say(what + ".", true);
+      return what + " (clicked \"" + clip(it.label, 40) + "\")";
+    };
+    // Pop-ups (dialogs) first.
+    for (size_t d = 0; d < dl.size(); ++d) {
+      const eyes::Dialog& g = dl[d];
+      std::string all = g.label + " " + g.text;
+      std::string key = page_key + "|" + fnv36(all.substr(0, 400));
+      if (popups_done.count(key)) continue;
+      std::vector<const eyes::Item*> btns;
+      for (auto& it : items)
+        if (it.dialog == int(d) && it.in_view && !it.secret && (it.kind == "button" || it.kind == "link")) btns.push_back(&it);
+      bool cookie = std::regex_search(all, cookie_rx);
+      bool agree = !cookie && std::regex_search(all, agree_rx);
+      bool nag = !cookie && !agree && std::regex_search(all, nag_rx);
+      const eyes::Item* pick = nullptr;
+      if (cookie) {
+        for (auto* b : btns)
+          if (!pick && std::regex_search(b->label, no_rx)) pick = b;
+        if (!pick) {
+          popups_done.insert(key);  // no "no" button: not for the spider to answer
+          say("a cookie box with no way to say no: it is yours to answer.", true);
+          continue;
+        }
+        return click(*pick, key, "said no to cookies");
+      }
+      if (agree) {
+        popups_done.insert(key);
+        say("a pop-up asks you to agree to terms: only you can say yes to that.", true);
+        continue;
+      }
+      if (nag) {
+        for (auto* b : btns)
+          if (!pick && (std::regex_search(b->label, close_rx) || std::regex_search(b->label, no_rx))) pick = b;
+        if (!pick) {
+          popups_done.insert(key);
+          continue;
+        }
+        return click(*pick, key, "closed a pop-up");
+      }
+    }
+    // A cookie bar that is not a dialog: only an unmistakable "no" button, with cookie words on the page.
+    bool cookie_words = false;
+    for (auto& b : blocks)
+      if (std::regex_search(b, cookie_rx)) {
+        cookie_words = true;
+        break;
+      }
+    if (cookie_words) {
+      static const std::regex strict_no(
+          R"(^\s*(reject all( cookies)?|reject (optional|non-essential|additional) cookies|decline (all|optional cookies)|refuse all|deny all|(use )?(only )?(strictly )?(necessary|essential) cookies( only)?|(only )?necessary only|continue without accepting)\s*$)",
+          std::regex::icase);
+      for (auto& it : items) {
+        if (!it.in_view || it.dialog >= 0 || it.secret || (it.kind != "button" && it.kind != "link")) continue;
+        std::string key = page_key + "|bar|" + it.label;
+        if (popups_done.count(key) || !std::regex_search(it.label, strict_no)) continue;
+        return click(it, key, "said no to cookies");
+      }
+    }
+    return {};
+  }
+
+  // What the window offers right now, for the AI that plans a task: what is
+  // on screen, where that is on the page ("screen 2 of 5", as Magentic-One's
+  // web surfer says it), the page's headings, where the goal's words are on
+  // the whole page, a numbered list of what can be clicked or typed into, and
+  // (asked for) a picture with those numbers drawn on it.
+  json snapshot(const json& req) {
     if (!attached) return nullptr;
+    last_snap_at = now_seconds();
+    // Pop-ups first, as Playwright's handlers run before each action.
+    std::string popup_note = handle_popups();
+    if (!popup_note.empty()) Sleep(900);  // the page settles after it closes
+    eyes::State st = eyes.state();
     snap_items = eyes.items(90);
+    snap_dialogs = eyes.dialogs();
     json items = json::array();
     std::set<std::string> labels;
     bool same = url == snap_url;
@@ -1091,6 +1217,8 @@ struct Crawler::Impl {
       else if (lw.rfind("play", 0) == 0 && lw.find("playlist") == std::string::npos) media = true;
       json x = {{"i", it.i}, {"kind", it.kind}, {"label", it.label}, {"href", it.href}, {"value", it.value}, {"inView", it.in_view},
                 {"search", it.search}, {"fresh", same && !snap_labels.count(it.label)}, {"near", it.row}, {"covered", false}};
+      if (it.dialog >= 0 && size_t(it.dialog) < snap_dialogs.size())
+        x["popup"] = snap_dialogs[size_t(it.dialog)].label.empty() ? std::string("a pop-up") : clip(snap_dialogs[size_t(it.dialog)].label, 50);
       items.push_back(x);
       labels.insert(it.label);
     }
@@ -1098,8 +1226,77 @@ struct Crawler::Impl {
     snap_url = url;
     json media_list = json::array();
     if (media) media_list.push_back({{"kind", "video"}, {"playing", playing}, {"time", 0}, {"duration", 0}, {"muted", false}});
-    return {{"url", url}, {"title", title}, {"text", clip(squash(text), 2500)}, {"media", media_list}, {"scroll", 0},
-            {"items", items}, {"app", app.name}};
+
+    // Where things are: on screen, or so many screens up or down.
+    bool geo = spans_layout == st.layout && spans.size() == blocks.size() && st.view.h > 50;
+    float top = float(st.scroll), vh = st.view.h, total = 0;
+    if (geo)
+      for (auto& s : spans)
+        if (!s.empty()) total = std::max(total, s.y + s.h);
+    auto where = [&](size_t i) -> std::string {
+      if (!geo || i >= spans.size() || spans[i].empty()) return "";
+      float mid = spans[i].y + spans[i].h / 2;
+      if (mid >= top && mid <= top + vh) return "on screen";
+      int n = std::max(1, int(std::ceil((mid < top ? top - mid : mid - top - vh) / vh)));
+      return std::to_string(n) + (n == 1 ? " screen " : " screens ") + (mid < top ? "up" : "down");
+    };
+    std::vector<std::string> terms_l;
+    if (req.contains("terms") && req["terms"].is_array())
+      for (auto& x : req["terms"])
+        if (x.is_string() && x.get<std::string>().size() >= 3) terms_l.push_back(lower_ascii(x.get<std::string>()));
+    std::string view_text, outline, hits;
+    // The paragraphs that hold the most of the goal's words, best first.
+    struct Hit {
+      size_t block, at;
+      int words;
+    };
+    std::vector<Hit> found;
+    for (size_t i = 0; i < blocks.size(); ++i) {
+      std::string w = where(i);
+      // On screen: any part of it (a long paragraph's middle may be off screen).
+      bool shows = geo && i < spans.size() && !spans[i].empty() && spans[i].y < top + vh && spans[i].y + spans[i].h > top;
+      if (shows && view_text.size() < 2400) view_text += blocks[i] + "\n";
+      if (i < heading.size() && heading[i] > 0 && outline.size() < 1400) outline += "- " + clip(blocks[i], 90) + (w.empty() ? "" : " (" + w + ")") + "\n";
+      if (terms_l.empty()) continue;
+      std::string lb = lower_ascii(blocks[i]);
+      size_t p = std::string::npos;
+      int n = 0;
+      for (auto& t : terms_l) {
+        size_t q = lb.find(t);
+        if (q != std::string::npos) ++n, p = std::min(p, q);
+      }
+      if (n) found.push_back({i, p, n});
+    }
+    std::stable_sort(found.begin(), found.end(), [](const Hit& a, const Hit& b) { return a.words > b.words; });
+    for (size_t k = 0; k < found.size() && k < 8; ++k) {
+      const std::string& b = blocks[found[k].block];
+      size_t from = found[k].at > 80 ? found[k].at - 80 : 0;
+      while (from > 0 && ((unsigned char)b[from] & 0xC0) == 0x80) --from;
+      std::string w = where(found[k].block);
+      hits += "- " + std::to_string(found[k].words) + " of your words: \"" + clip(b.substr(from), 200) + "\"" + (w.empty() ? "" : " (" + w + ")") + "\n";
+    }
+    if (view_text.empty()) view_text = clip(squash(text), 2500);  // no geometry: the start of the text
+    std::string at;
+    if (geo && total > vh) {
+      int n = std::max(1, int(std::ceil(total / vh))), k = std::min(n, int(top / vh) + 1);
+      at = "screen " + std::to_string(k) + " of " + std::to_string(n);
+    } else if (geo) {
+      at = "the whole page fits on the screen";
+    }
+    // The picture, with the number of everything on screen that can be clicked or typed into.
+    std::string pic;
+    if (req.value("picture", false) && st.visible) {
+      eyes::Pixels px = eyes::grab(target);
+      std::vector<std::pair<int, RECT>> marks;
+      for (auto& it : snap_items)
+        if (it.in_view && !it.secret && !it.r.empty())
+          marks.push_back({it.i, RECT{LONG(it.r.x), LONG(it.r.y), LONG(it.r.x + it.r.w), LONG(it.r.y + it.r.h)}});
+      eyes::draw_marks(px, marks);
+      pic = eyes::jpeg_base64(px, 1024, 78);
+    }
+    return {{"url", url},     {"title", title},     {"text", clip(view_text, 2500)}, {"where", at},
+            {"outline", outline}, {"hits", hits},   {"media", media_list},          {"scroll", 0},
+            {"items", items}, {"app", app.name},    {"picture", pic}, {"popup_note", popup_note}};
   }
 
   void report(json m) {
@@ -1189,6 +1386,14 @@ struct Crawler::Impl {
   // send or post something, sign you in or up, or can't be undone.
   bool risky(const json& step, const eyes::Item& it, const std::vector<eyes::Item>& all) const {
     if (std::regex_search(it.label, kRisky)) return true;
+    // A link whose words say nothing ("", an icon) but whose address signs you out.
+    static const std::regex out_href(R"(/(logout|signout|log-out|sign-out|logoff|signoff)\b)", std::regex::icase);
+    if (std::regex_search(it.href, out_href)) return true;
+    static const std::regex agree_rx(R"(\b(agree to|terms of (use|service)|accept (the|our) terms|by continuing|by clicking|end user licen[cs]e|eula)\b)",
+                                     std::regex::icase);
+    if (it.dialog >= 0 && size_t(it.dialog) < snap_dialogs.size() &&
+        std::regex_search(snap_dialogs[size_t(it.dialog)].label + " " + snap_dialogs[size_t(it.dialog)].text, agree_rx))
+      return true;
     if (jstr(step, "verb") == "type") return step.value("enter", false) && !it.search;
     // A button next to a password box signs you in or up.
     if (it.kind == "button")
@@ -1237,6 +1442,49 @@ struct Crawler::Impl {
     if (verb == "scroll") {
       std::string dir = jstr(act.step, "dir");
       return done(eyes.scroll(dir.empty() ? "down" : dir), "scrolled");
+    }
+    if (verb == "find") {
+      // Find on the page (Ctrl+F): the whole page at once, free and instant;
+      // the spider jumps to the first one. It never fails: "not on this page"
+      // is an answer too.
+      std::string q = squash(jstr(act.step, "text"));
+      if (q.size() < 2) return act_fail("nothing to find.");
+      std::string lq = lower_ascii(q);
+      int count = 0;
+      struct Spot {
+        size_t block, at;
+      };
+      std::vector<Spot> spots;  // the first match in each paragraph that has one
+      for (size_t i = 0; i < blocks.size(); ++i) {
+        std::string lb = lower_ascii(blocks[i]);
+        bool here = false;
+        for (size_t p = lb.find(lq); p != std::string::npos; p = lb.find(lq, p + 1)) {
+          if (!here) spots.push_back({i, p}), here = true;
+          ++count;
+        }
+      }
+      if (spots.empty()) return done(true, "\"" + clip(q, 60) + "\" is not on this page");
+      // It jumps to a real sentence: not a label or a line that only repeats
+      // the words (a "9 results for ..." heading after a search).
+      size_t go = 0;
+      for (size_t k = 0; k < spots.size(); ++k)
+        if (blocks[spots[k].block].size() > q.size() + 40) {
+          go = k;
+          break;
+        }
+      bool shown = eyes.scroll_to_text(q, blocks[spots[go].block]);
+      auto around = [&](const Spot& s) {
+        const std::string& b = blocks[s.block];
+        size_t from = s.at > 90 ? s.at - 90 : 0;
+        while (from > 0 && ((unsigned char)b[from] & 0xC0) == 0x80) --from;
+        return "\"" + clip(b.substr(from), 220) + "\"";
+      };
+      std::string note = "found \"" + clip(q, 60) + "\" " + std::to_string(count) + (count == 1 ? " time: " : " times: ") + around(spots[go]) +
+                         (shown ? " (now on screen)" : " (could not bring it on screen)");
+      int more = 0;
+      for (size_t k = 0; k < spots.size() && more < 2; ++k)
+        if (k != go) note += (more++ ? "; " : "; also: ") + around(spots[k]);
+      return done(true, note);
     }
     if (verb == "key") {
       std::string k = jstr(act.step, "key");
@@ -1298,6 +1546,7 @@ struct Crawler::Impl {
     auto [want, hint] = want_of(jstr(act.step, "what").empty() ? (typing ? "search" : "") : jstr(act.step, "what"));
     std::vector<eyes::Item> all = eyes.items(300);
     snap_items = all;  // the numbers now refer to this list
+    snap_dialogs = eyes.dialogs();  // and so do the pop-ups they sit in
     struct Scored {
       const eyes::Item* it;
       double s;

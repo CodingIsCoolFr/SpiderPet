@@ -28,6 +28,32 @@ std::string bstr_utf8(BSTR b) { return b ? utf8(std::wstring_view(b, SysStringLe
 
 Box to_box(const RECT& r) { return Box{float(r.left), float(r.top), float(r.right - r.left), float(r.bottom - r.top)}; }
 
+// Who an element is (its runtime id), to compare elements without asking the app again.
+std::vector<int> rid_of(IUIAutomationElement* e, bool cached) {
+  std::vector<int> id;
+  SAFEARRAY* sa = nullptr;
+  VARIANT v;
+  VariantInit(&v);
+  if (cached) {
+    if (SUCCEEDED(e->GetCachedPropertyValue(UIA_RuntimeIdPropertyId, &v)) && (v.vt & VT_ARRAY) && v.parray) sa = v.parray;
+  } else if (FAILED(e->GetRuntimeId(&sa))) {
+    sa = nullptr;
+  }
+  if (sa) {
+    LONG lo = 0, hi = -1;
+    SafeArrayGetLBound(sa, 1, &lo);
+    SafeArrayGetUBound(sa, 1, &hi);
+    for (LONG k = lo; k <= hi && k - lo < 16; ++k) {
+      int x = 0;
+      SafeArrayGetElement(sa, &k, &x);
+      id.push_back(x);
+    }
+    if (!cached) SafeArrayDestroy(sa);
+  }
+  VariantClear(&v);
+  return id;
+}
+
 std::string squash(const std::string& s) {
   std::string out;
   bool sp = false;
@@ -212,9 +238,15 @@ struct Eyes::Impl {
     std::string href;
     int box = 0;       // the element it sits in (a paragraph, a cell), links aside
     int item = 0;      // the list item, row or tree item it sits in (0: none)
+    std::vector<int> rid;                // who it is
+    std::vector<std::vector<int>> up;    // the small elements around it (a link, a paragraph), nearest first
   };
   std::vector<Leaf> leaves;
   int box_seq = 0, cur_box = 0, cur_item = 0;  // while collecting: where the pieces sit
+  std::vector<std::pair<std::vector<int>, long long>> anc;  // while collecting: the elements above, and their areas
+  long long small_area = 0;                                  // an element this big or smaller is "around" a piece, not a page section
+  // Hit tests (is this find really showing?), kept a moment: find id + where -> (when, yes/no).
+  std::map<std::string, std::pair<ULONGLONG, bool>> hits_seen;
   std::vector<std::string> blocks;
   std::vector<int> block_heading;
   std::vector<Box> block_geom;
@@ -254,6 +286,7 @@ struct Eyes::Impl {
     CONTROLTYPEID ct = 0;
   };
   std::vector<Held> held;  // the numbered things from the last items()
+  std::vector<Dialog> dialogs_seen;  // the pop-ups from the last items()
 
   // ------------------------------------------------ published
   std::mutex smu;
@@ -656,7 +689,7 @@ struct Eyes::Impl {
     ComPtr<IUIAutomationCacheRequest> cr;
     uia->CreateCacheRequest(&cr);
     for (PROPERTYID p : {UIA_NamePropertyId, UIA_ControlTypePropertyId, UIA_BoundingRectanglePropertyId, UIA_ValueValuePropertyId,
-                         UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId, UIA_HeadingLevelPropertyId})
+                         UIA_IsOffscreenPropertyId, UIA_IsPasswordPropertyId, UIA_HeadingLevelPropertyId, UIA_RuntimeIdPropertyId})
       cr->AddProperty(p);
     cr->put_TreeScope(TreeScope_Subtree);
     if (raw) {
@@ -686,9 +719,19 @@ struct Eyes::Impl {
       int ob = cur_box, oi = cur_item;
       if (ct != UIA_HyperlinkControlTypeId) cur_box = ++box_seq;
       if (ct == UIA_ListItemControlTypeId || ct == UIA_TreeItemControlTypeId || ct == UIA_DataItemControlTypeId) cur_item = cur_box;
+      RECT cr{};
+      c->get_CachedBoundingRectangle(&cr);
+      anc.push_back({rid_of(c, true), (long long)(cr.right - cr.left) * (cr.bottom - cr.top)});
       collect(c, link, depth + 1, h, page);
+      anc.pop_back();
       cur_box = ob;
       cur_item = oi;
+    };
+    // Who a piece is, and the small elements right around it (for hit tests).
+    auto who = [&](Leaf& l, IUIAutomationElement* c) {
+      l.rid = rid_of(c, true);
+      for (size_t k = anc.size(); k > 0 && l.up.size() < 3; --k)
+        if (anc[k - 1].second <= small_area && !anc[k - 1].first.empty()) l.up.push_back(anc[k - 1].first);
     };
     ComPtr<IUIAutomationElementArray> kids;
     if (depth > 120 || FAILED(e->GetCachedChildren(&kids)) || !kids) return;
@@ -700,6 +743,10 @@ struct Eyes::Impl {
       ++seen_elements;
       CONTROLTYPEID ct = 0;
       c->get_CachedControlType(&ct);
+      // A closed drop-down's choices are not on screen, but Firefox gives them
+      // boxes below it as if they were: reading them put silk and reading
+      // marks over empty space. Its chosen value is a control, not page text.
+      if (ct == UIA_ComboBoxControlTypeId) continue;
       std::string link = href;
       if (ct == UIA_HyperlinkControlTypeId) {
         VARIANT v;
@@ -775,6 +822,7 @@ struct Eyes::Impl {
                 l.href = link;
                 l.box = cur_box;
                 l.item = cur_item;
+                who(l, c.Get());
                 leaves.push_back(std::move(l));
                 ++lines;
               }
@@ -809,6 +857,7 @@ struct Eyes::Impl {
           l.heading = h;
           l.box = cur_box;
           l.item = cur_item;
+          who(l, c.Get());
           l.own = !page && ct != UIA_TextControlTypeId && ct != UIA_HyperlinkControlTypeId;
           leaves.push_back(std::move(l));
         }
@@ -909,6 +958,12 @@ struct Eyes::Impl {
     IUIAutomationElement* scope = main ? main.Get() : page ? doc.Get() : root.Get();
     if (FAILED(scope->BuildUpdatedCache(cr.Get(), &cached)) || !cached) return;
     box_seq = cur_box = cur_item = 0;
+    anc.clear();
+    hits_seen.clear();
+    {
+      RECT vr = view_rect();
+      small_area = std::max(1LL, (long long)(vr.right - vr.left) * (vr.bottom - vr.top) / 4);
+    }
     collect(cached.Get(), std::string(), 0, 0, page);
     split_blocks_by_layout();
     for (size_t i = 0; i < leaves.size(); ++i) alnum_append(leaves[i].text, int(i), flat, &flat_map);
@@ -1186,8 +1241,9 @@ struct Eyes::Impl {
     return r;
   }
 
-  std::vector<Box> boxes_for(const std::string& text, size_t anchor_at) {
+  std::vector<Box> boxes_for(const std::string& text, size_t anchor_at, int* leaf_out = nullptr) {
     std::vector<Box> out;
+    if (leaf_out) *leaf_out = -1;
     std::wstring q = alnum(text);
     if (q.size() < 2) return out;
     size_t best = std::wstring::npos, best_d = SIZE_MAX;
@@ -1211,6 +1267,7 @@ struct Eyes::Impl {
       if (leaves.empty() && tp) search(tp.Get());
     } else {
       size_t s = best, e = best + q.size();
+      if (leaf_out) *leaf_out = flat_map[s].first;
       // A web page: the exact words.
       if (tp && doc) {
         ComPtr<IUIAutomationTextRange> r = range_for(s, e);
@@ -1243,7 +1300,34 @@ struct Eyes::Impl {
     return keep;
   }
 
-  std::vector<Box> find_text_now(const std::string& text, const std::string& near_block) {
+  // Is the piece really what shows at this box? Windows says what is at the
+  // box's middle (as Playwright and browser-use ask the page with
+  // elementFromPoint before a click): the piece itself, a small element right
+  // around it (its link, its paragraph), or something inside it. Anything
+  // else (a page's own pop-up on top, empty space where hidden text claims to
+  // be) means the find is not showing there. Unknown answers keep it.
+  bool shows_at(int leaf, const Box& b) {
+    if (leaf < 0 || leaf >= int(leaves.size()) || leaves[size_t(leaf)].rid.empty() || b.empty()) return true;
+    const Leaf& l = leaves[size_t(leaf)];
+    POINT pt{LONG(b.x + b.w / 2), LONG(b.y + b.h / 2)};
+    ComPtr<IUIAutomationElement> h;
+    if (FAILED(uia->ElementFromPoint(pt, &h)) || !h) return true;
+    int pid = 0;
+    if (SUCCEEDED(h->get_CurrentProcessId(&pid)) && DWORD(pid) == GetCurrentProcessId()) return true;  // our own layer: no answer
+    std::vector<int> hr = rid_of(h.Get(), false);
+    if (hr.empty()) return true;
+    if (hr == l.rid) return true;
+    for (auto& a : l.up)
+      if (a == hr) return true;
+    if (!walker) return false;
+    ComPtr<IUIAutomationTreeWalker> raw;
+    uia->get_RawViewWalker(&raw);
+    ComPtr<IUIAutomationElement> p;
+    if (raw && SUCCEEDED(raw->GetParentElement(h.Get(), &p)) && p && rid_of(p.Get(), false) == l.rid) return true;  // its own text
+    return false;
+  }
+
+  std::vector<Box> find_text_now(const std::string& text, const std::string& near_block, int* leaf_out = nullptr) {
     if (!leaves_ready) load_leaves();
     size_t at = 0;
     if (!near_block.empty()) {
@@ -1253,21 +1337,50 @@ struct Eyes::Impl {
         if (p != std::wstring::npos) at = p;
       }
     }
-    return boxes_for(text, at);
+    return boxes_for(text, at, leaf_out);
   }
 
-  bool scroll_to_text_now(const std::string& text) {
+  // Brings text on screen, and says so only when it really is: the text
+  // range scrolls itself into view, else the piece it is in does, else the
+  // page's scroller moves by the distance to it (some browsers say yes to the
+  // first two and do nothing). `para` picks the right one of several.
+  bool scroll_to_text_now(const std::string& text, const std::string& para) {
     if (!leaves_ready) load_leaves();
     std::wstring q = alnum(text);
-    size_t p = q.size() >= 4 ? flat.find(q) : std::wstring::npos;
+    if (q.size() < 2) return false;
+    size_t from = 0;
+    if (std::wstring b = alnum(para); b.size() >= 12) {
+      size_t p = flat.find(b.substr(0, std::min<size_t>(40, b.size())));
+      if (p != std::wstring::npos) from = p;
+    }
+    size_t p = flat.find(q, from);
+    if (p == std::wstring::npos) p = flat.find(q);
     if (p == std::wstring::npos) return false;
+    auto on_screen = [&] {
+      Sleep(150);  // smooth scrolling takes a moment
+      return !boxes_for(text, p).empty();
+    };
     if (tp && doc) {
       ComPtr<IUIAutomationTextRange> r = range_for(p, p + q.size());
-      if (r && SUCCEEDED(r->ScrollIntoView(TRUE))) return true;
+      if (r && SUCCEEDED(r->ScrollIntoView(TRUE)) && on_screen()) return true;
     }
-    int li = flat_map[p].first;
+    const Leaf& leaf = leaves[size_t(flat_map[p].first)];
     ComPtr<IUIAutomationScrollItemPattern> si;
-    if (SUCCEEDED(leaves[size_t(li)].el->GetCurrentPatternAs(UIA_ScrollItemPatternId, IID_PPV_ARGS(&si))) && si) return SUCCEEDED(si->ScrollIntoView());
+    if (SUCCEEDED(leaf.el->GetCurrentPatternAs(UIA_ScrollItemPatternId, IID_PPV_ARGS(&si))) && si && SUCCEEDED(si->ScrollIntoView()) && on_screen())
+      return true;
+    // The scroller, by the distance: the piece a third of the way down the screen.
+    RECT er{}, v = view_rect();
+    ComPtr<IUIAutomationElement> sc = find_scroller();
+    ComPtr<IUIAutomationScrollPattern> sp;
+    double pct = -1, size = 0;
+    if (sc && SUCCEEDED(leaf.el->get_CurrentBoundingRectangle(&er)) && er.bottom > er.top &&
+        SUCCEEDED(sc->GetCurrentPatternAs(UIA_ScrollPatternId, IID_PPV_ARGS(&sp))) && sp &&
+        SUCCEEDED(sp->get_CurrentVerticalScrollPercent(&pct)) && SUCCEEDED(sp->get_CurrentVerticalViewSize(&size)) && pct >= 0 && size > 0 &&
+        size < 100) {
+      double view_h = double(v.bottom - v.top), range = view_h * 100.0 / size - view_h;
+      double target = std::clamp(pct / 100.0 * range + double(er.top - v.top) - view_h / 3.0, 0.0, range);
+      if (range > 0 && SUCCEEDED(sp->SetScrollPercent(UIA_ScrollPatternNoScroll, target / range * 100.0)) && on_screen()) return true;
+    }
     return false;
   }
 
@@ -1361,7 +1474,8 @@ struct Eyes::Impl {
   // What can be clicked or typed into, by Windows-MCP's rules: enabled,
   // visible (an off-screen box still counts), a real control, and of a kind
   // you act on. Each keeps the words of the row it sits in.
-  void gather(IUIAutomationElement* e, int depth, const std::string& row, RECT v, std::set<std::vector<int>>& ancestors) {
+  void gather(IUIAutomationElement* e, int depth, const std::string& row, RECT v, std::set<std::vector<int>>& ancestors, bool in_search,
+              int dialog) {
     ComPtr<IUIAutomationElementArray> kids;
     if (depth > 120 || held.size() >= 400 || FAILED(e->GetCachedChildren(&kids)) || !kids) return;
     int n = 0;
@@ -1388,12 +1502,37 @@ struct Eyes::Impl {
       if (!id.empty()) ancestors.insert(id);
       CONTROLTYPEID ct = 0;
       c->get_CachedControlType(&ct);
+      // Inside the page's search area (a form marked as search): its box is a search box, whatever its label says.
+      VARIANT lmv;
+      VariantInit(&lmv);
+      bool search_here = in_search;
+      if (SUCCEEDED(c->GetCachedPropertyValue(UIA_LandmarkTypePropertyId, &lmv)) && lmv.vt == VT_I4 && lmv.lVal == UIA_SearchLandmarkTypeId)
+        search_here = true;
+      VariantClear(&lmv);
       BSTR b = nullptr;
       c->get_CachedName(&b);
       std::string name = squash(bstr_utf8(b));
       SysFreeString(b);
       RECT r{};
       c->get_CachedBoundingRectangle(&r);
+      // A pop-up (role dialog / alert dialog): what is inside it is marked, and its words kept.
+      int in_dialog = dialog;
+      {
+        VARIANT dv;
+        VariantInit(&dv);
+        bool is_dialog = SUCCEEDED(c->GetCachedPropertyValue(UIA_IsDialogPropertyId, &dv)) && dv.vt == VT_BOOL && dv.boolVal == VARIANT_TRUE;
+        VariantClear(&dv);
+        if (!is_dialog && SUCCEEDED(c->GetCachedPropertyValue(UIA_LocalizedControlTypePropertyId, &dv)) && dv.vt == VT_BSTR)
+          is_dialog = lower_ascii(bstr_utf8(dv.bstrVal)).find("dialog") != std::string::npos;
+        VariantClear(&dv);
+        if (is_dialog && dialog < 0 && r.right > r.left && r.bottom > r.top && dialogs_seen.size() < 8) {
+          dialogs_seen.push_back(Dialog{name.substr(0, 120), std::string(), to_box(r)});
+          in_dialog = int(dialogs_seen.size()) - 1;
+        } else if (in_dialog >= 0 && !name.empty() && (ct == UIA_TextControlTypeId || ct == UIA_HyperlinkControlTypeId) &&
+                   dialogs_seen[size_t(in_dialog)].text.size() < 800) {
+          dialogs_seen[size_t(in_dialog)].text += name.substr(0, 300) + " ";
+        }
+      }
       BOOL off = FALSE, enabled = TRUE, pw = FALSE, focusable = FALSE;
       c->get_CachedIsOffscreen(&off);
       c->get_CachedIsEnabled(&enabled);
@@ -1430,11 +1569,13 @@ struct Eyes::Impl {
         SysFreeString(aid);
         if (std::regex_search(auto_id, kSecretRx)) it.secret = true;
         std::string ln = lower_ascii(name);
-        it.search = ct == UIA_EditControlTypeId && (ln.find("search") != std::string::npos || auto_id.find("search") != std::string::npos ||
-                                                    auto_id == "q" || ln.find("address") != std::string::npos);
+        it.search = ct == UIA_EditControlTypeId && (search_here || ln.find("search") != std::string::npos ||
+                                                    auto_id.find("search") != std::string::npos || auto_id == "q" ||
+                                                    ln.find("address") != std::string::npos);
         if (it.label.empty() && !auto_id.empty() && ct != UIA_EditControlTypeId) it.label = auto_id;
         if (row.size() > it.label.size() + 4 && row.size() < 220 && (it.label.size() < 12)) it.row = row.substr(0, 140);
         it.r = to_box(r);
+        it.dialog = in_dialog;
         it.in_view = !off && r.bottom > v.top && r.top < v.bottom && r.right > v.left && r.left < v.right;
         if (!it.label.empty() || it.kind == "field" || it.kind == "list") held.push_back(std::move(hd));
       }
@@ -1443,20 +1584,22 @@ struct Eyes::Impl {
       if ((ct == UIA_ListItemControlTypeId || ct == UIA_DataItemControlTypeId || ct == UIA_GroupControlTypeId || ct == UIA_TreeItemControlTypeId) &&
           name.size() > 3 && name.size() < 220)
         sub = name;
-      gather(c.Get(), depth + 1, sub, v, ancestors);
+      gather(c.Get(), depth + 1, sub, v, ancestors, search_here, in_dialog);
       if (!id.empty()) ancestors.erase(id);
     }
   }
 
   std::vector<Item> items_now(int max) {
     held.clear();
+    dialogs_seen.clear();
     std::vector<Item> out;
     if (!root) return out;
     ComPtr<IUIAutomationCacheRequest> cr;
     uia->CreateCacheRequest(&cr);
     for (PROPERTYID p : {UIA_NamePropertyId, UIA_ControlTypePropertyId, UIA_BoundingRectanglePropertyId, UIA_ValueValuePropertyId,
                          UIA_IsOffscreenPropertyId, UIA_IsEnabledPropertyId, UIA_IsPasswordPropertyId, UIA_IsKeyboardFocusablePropertyId,
-                         UIA_AutomationIdPropertyId, UIA_RuntimeIdPropertyId})
+                         UIA_AutomationIdPropertyId, UIA_RuntimeIdPropertyId, UIA_LandmarkTypePropertyId, UIA_IsDialogPropertyId,
+                         UIA_LocalizedControlTypePropertyId})
       cr->AddProperty(p);
     cr->put_TreeScope(TreeScope_Subtree);
     // The whole window: a page's own buttons, and the app's (the address bar,
@@ -1471,7 +1614,7 @@ struct Eyes::Impl {
     RECT v{};
     GetWindowRect(hwnd, &v);
     std::set<std::vector<int>> anc;
-    gather(cached.Get(), 0, std::string(), v, anc);
+    gather(cached.Get(), 0, std::string(), v, anc, false, -1);
     // On screen first, then the rest in reading order.
     std::stable_sort(held.begin(), held.end(), [](const Held& a, const Held& b) { return a.item.in_view > b.item.in_view; });
     if (int(held.size()) > max) held.resize(size_t(max));
@@ -1725,9 +1868,24 @@ Spots Eyes::locate(const std::vector<Spot>& want) {
     }
     ULONGLONG t0 = GetTickCount64();
     std::map<std::string, std::vector<Box>> screen;
+    if (d->hits_seen.size() > 600) d->hits_seen.clear();
     for (auto& w : want) {
-      auto b = d->find_text_now(w.text, w.para);
-      if (!b.empty()) screen[w.id] = std::move(b);
+      int leaf = -1;
+      auto b = d->find_text_now(w.text, w.para, &leaf);
+      if (b.empty()) continue;
+      // Really showing there, not under a pop-up or as hidden text? Asked
+      // again every second, and whenever it is somewhere new on screen.
+      std::string key = w.id + "|" + std::to_string(int(b[0].x)) + "," + std::to_string(int(b[0].y));
+      ULONGLONG now = GetTickCount64();
+      auto it = d->hits_seen.find(key);
+      bool shows;
+      if (it != d->hits_seen.end() && now - it->second.first < 1000) {
+        shows = it->second.second;
+      } else {
+        shows = d->shows_at(leaf, b[0]);
+        d->hits_seen[key] = {now, shows};
+      }
+      if (shows) screen[w.id] = std::move(b);
     }
     // Into content space with the geometry of this moment. When anything
     // moved meanwhile, the boxes may be off: the caller measures again.
@@ -1750,12 +1908,16 @@ void Eyes::word_at(POINT pt, std::function<void(const WordHit&)> cb) {
   d->words.push_back({pt, std::move(cb)});
 }
 
-bool Eyes::scroll_to_text(const std::string& text) {
-  return d->call([this, text] { return d->scroll_to_text_now(text); }, 4000);
+bool Eyes::scroll_to_text(const std::string& text, const std::string& para) {
+  return d->call([this, text, para] { return d->scroll_to_text_now(text, para); }, 5000);
 }
 
 std::vector<Item> Eyes::items(int max) {
   return d->call([this, max] { return d->items_now(max); }, 15000);
+}
+
+std::vector<Dialog> Eyes::dialogs() {
+  return d->call([this] { return d->dialogs_seen; }, 3000);
 }
 
 bool Eyes::show_item(int i) {

@@ -89,6 +89,15 @@ struct Item {
   std::vector<std::string> options;
   bool in_view = false, search = false, secret = false;
   Box r;              // screen pixels
+  int dialog = -1;    // the pop-up (dialog) it sits in: an index into Eyes::dialogs(), -1 for none
+};
+
+// A pop-up on the page or in the app (a dialog: a cookie box, a newsletter
+// offer, a "sign in" box, terms to agree to), from the last items().
+struct Dialog {
+  std::string label;  // its own name ("Cookie consent"), often empty
+  std::string text;   // the words in it (up to ~800 characters)
+  Box r;              // screen pixels
 };
 
 // A word under a point, for the spider's feet.
@@ -139,12 +148,15 @@ class Eyes {
   // as wide as the page) are dropped.
   Spots locate(const std::vector<Spot>& want);
   void word_at(POINT pt, std::function<void(const WordHit&)> cb);
-  bool scroll_to_text(const std::string& text);
+  // Brings text on screen; true only when it really is on screen afterwards.
+  // `para` (the paragraph it is in) picks the right one when it is there twice.
+  bool scroll_to_text(const std::string& text, const std::string& para = "");
 
   // Tasks. items() numbers what can be clicked or typed into; the others act
   // on those numbers. Read only toward secrets: a password or card box is
   // marked secret and never typed into.
   std::vector<Item> items(int max);
+  std::vector<Dialog> dialogs();                 // the pop-ups found by the last items()
   bool show_item(int i);                         // scrolls it into view
   Box item_box(int i);
   bool click_item(int i, std::string* note);

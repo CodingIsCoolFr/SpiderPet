@@ -35,6 +35,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <regex>
 #include <set>
 #include <thread>
 
@@ -49,7 +50,7 @@ namespace {
 constexpr UINT kTrayMsg = WM_APP + 1;
 constexpr UINT kShowMsg = WM_APP + 2;
 constexpr UINT kWakeMsg = WM_APP + 3;
-constexpr const char* kVersion = "4.0.1";
+constexpr const char* kVersion = "4.1.0";
 
 ImVec4 hexv(uint32_t c, float a = 1.f) {
   return ImVec4(((c >> 16) & 0xFF) / 255.f, ((c >> 8) & 0xFF) / 255.f, (c & 0xFF) / 255.f, a);
@@ -453,9 +454,33 @@ std::string step_text(const json& s) {
   if (v == "reload") return "Reload the page";
   if (v == "media") return jstr(s, "op") == "pause" ? "Pause the video" : "Play the video";
   if (v == "goto") return "Open " + jstr(s, "url");
+  if (v == "find") return "Find \"" + jstr(s, "text") + "\" on the page";
   if (v == "type")
     return "Type \"" + jstr(s, "text") + "\" into " + jstr(s, "what") + (s.value("enter", false) ? " and press Enter" : "");
   return "Click " + jstr(s, "what");
+}
+
+// The goal's own words, to find them on a page ("find me the Binx avatar on
+// this site" -> binx, avatar): no filler, no words about the site itself.
+json goal_words(const std::string& goal, const json& intent) {
+  static const std::set<std::string> filler = {
+      "find", "the", "this", "that", "for", "and", "website", "site", "page", "web", "please", "can", "you", "could", "would",
+      "show", "get", "look", "search", "want", "need", "open", "from", "with", "some", "any", "all", "where", "what", "how",
+      "into", "onto", "about", "there", "here", "its", "it's", "one", "out", "help", "let", "lets", "let's", "go"};
+  const std::string src = goal + " " + (intent.is_object() ? jstr(intent, "query") : std::string());
+  json out = json::array();
+  std::set<std::string> seen;
+  std::string cur;
+  auto flush = [&] {
+    if (cur.size() >= 3 && !filler.count(cur) && seen.insert(cur).second && out.size() < 8) out.push_back(cur);
+    cur.clear();
+  };
+  for (unsigned char c : src) {
+    if (std::isalnum(c) || c >= 0x80 || c == '\'') cur += static_cast<char>(c >= 0x80 ? c : std::tolower(c));
+    else flush();
+  }
+  flush();
+  return out;
 }
 
 // A goal in your own words ("play a cat video on YouTube", "please sign me up
@@ -665,6 +690,9 @@ class App {
     std::string memory;                // a goal: the AI's own notes, carried from step to step
     int false_done = 0;                // a goal: times the AI said done but the page said otherwise
     std::string hint;                  // a goal: something to tell you at the end (it plays without sound)
+    std::string last_url;              // a goal: the page of the last look
+    int same_url = 0;                  // a goal: looks in a row at that same page (3+ without progress: stuck)
+    std::vector<std::string> recent;   // a goal: its last steps, to see it go back and forth or repeat itself
     bool auto_go = false;              // a safe step: it goes by itself at auto_at
     double auto_at = 0;
     std::string command;
@@ -757,7 +785,7 @@ int App::run(HINSTANCE inst, bool tray) {
         snprintf(goal_, sizeof(goal_), "%s", test_goal_.c_str());
         HWND w = hwnd_;
         std::thread([w] {
-          Sleep(4000);  // the spider settles on its window first
+          Sleep(10000);  // the spider settles on its window first (a browser can take 6 s to open its page to it)
           PostMessageW(w, WM_APP + 9, 0, 0);
         }).detach();
       }
@@ -855,6 +883,8 @@ void App::on_message(int client, const json& raw) {
   const std::string type = jstr(m, "type");
   if (type.rfind("act", 0) == 0 || type == "snap")
     debug_log("task: " + type + " " + jstr(m, "desc") + jstr(m, "note") + (m.contains("ok") ? (m.value("ok", false) ? " (ok)" : " (failed)") : ""));
+  if (type == "act-ready" || type == "act-done")
+    task_log("  " + type + ": " + jstr(m, "desc") + jstr(m, "note").substr(0, 300) + (m.contains("ok") ? (m.value("ok", false) ? " (ok)" : " (failed)") : ""));
   std::unique_lock lock(mu_);
   if (type == "hello") {
     browsers_[client].name = jstr(m, "browser").empty() ? "browser" : jstr(m, "browser");
@@ -985,9 +1015,39 @@ void App::on_message(int client, const json& raw) {
     task_.tab = m.value("tabId", -1);
     task_.state = Task::Thinking;
     task_.since = now_seconds();
+    // Stuck on one page (browser-use's rule: 3+ looks without progress) or the
+    // last step failed: it is told so, and thinks it over this time.
+    if (!jstr(snap, "popup_note").empty()) task_.history.push_back("(the spider itself " + jstr(snap, "popup_note") + ")");
+    std::string here = jstr(snap, "url");
+    here = here.substr(0, here.find('#'));  // a jump inside the page is the same page
+    task_.same_url = here == task_.last_url ? task_.same_url + 1 : 0;
+    task_.last_url = here;
+    bool stuck = task_.same_url >= 3 && task_.same_url % 3 == 0;
+    if (stuck)
+      task_.history.push_back("(note: " + std::to_string(task_.same_url + 1) +
+                              " looks at this same page. If what you want is not here, change approach: find on the page, the "
+                              "site's own search, a web search limited to this site, another section, or go back.)");
+    // Back and forth (scroll down, up, down...) or the same step three times: stuck too.
+    const auto& rc = task_.recent;
+    int ups = 0, downs = 0;
+    for (size_t k = rc.size() >= 4 ? rc.size() - 4 : 0; k < rc.size(); ++k) {
+      ups += rc[k] == "scroll up";
+      downs += rc[k] == "scroll down";
+    }
+    const bool wobble = ups && downs && ups + downs >= 4;
+    const bool again = rc.size() >= 3 && rc[rc.size() - 1] == rc[rc.size() - 2] && rc[rc.size() - 2] == rc[rc.size() - 3] && !rc.back().starts_with("scroll");
+    if (wobble || again) {
+      task_.history.push_back(wobble ? "(note: you scrolled up and down without getting it on screen. Use find with exact words from "
+                                       "'Where your words are'. When find shows the words you need, they are on screen: if they answer "
+                                       "the request, say done and quote them.)"
+                                     : "(note: you did the same step three times. It does not get you closer: do something else.)");
+      task_.recent.clear();
+      stuck = true;
+    }
+    const bool hard = task_.fails > 0 || stuck;
     json hist = json::array();
     for (const std::string& h : task_.history) hist.push_back(h);
-    urgent_.push_front({Job::Agent, jstr(snap, "url"), "", {{"seq", task_.seq}, {"goal", task_.command}, {"intent", task_.intent}, {"memory", task_.memory}, {"history", hist}, {"snap", snap}}});
+    urgent_.push_front({Job::Agent, here, "", {{"seq", task_.seq}, {"goal", task_.command}, {"intent", task_.intent}, {"memory", task_.memory}, {"history", hist}, {"snap", snap}, {"hard", hard}}});
     cv_.notify_all();
     wake();
     return;
@@ -1335,15 +1395,19 @@ void App::worker() {
         busy_ = "planning the next step";
       }
       wake();
-      bool think;
+      // Thinking out loud is slow on a local model (a minute a step): it
+      // thinks when it plans the goal, and again only when a step failed or
+      // it is stuck. The steps in between are quick.
+      json intent = job.data["intent"];
+      bool think_plan, think_step;
       {
         std::lock_guard lock(mu_);
-        think = settings_.think_tasks;
-        if (think) busy_ = "thinking about the next step";
+        think_plan = settings_.think_tasks;
+        think_step = settings_.think_tasks && job.data.value("hard", false);
+        busy_ = !intent.is_object() ? "working out the goal" : think_step ? "thinking it over" : "picking the next step";
       }
       wake();
       // The first time: what the goal really asks for ("play me a cat video" is a video about cats, playing).
-      json intent = job.data["intent"];
       if (!intent.is_object()) {
         // The plan is made looking at the page you are on, so it uses that page's own buttons.
         const json& snap = job.data["snap"];
@@ -1353,17 +1417,28 @@ void App::worker() {
             if (page.size() > 3800) break;
             page += "\n- " + jstr(it, "kind") + ": " + jstr(it, "label");
           }
-        intent = checker_.understand(jstr(job.data, "goal"), page, think);
+        const double t0 = now_seconds();
+        intent = checker_.understand(jstr(job.data, "goal"), page, think_plan);
+        debug_log("agent: plan " + std::to_string(static_cast<int>(now_seconds() - t0)) + "s " +
+                  (intent.is_object() ? intent.dump(-1, ' ', false, json::error_handler_t::replace).substr(0, 600) : std::string("(no answer)")));
         std::lock_guard lock(mu_);
         if (job.data.value("seq", -1) == task_.seq && intent.is_object()) {
           task_.intent = intent;
           task_.plan_step = 1;
           task_.say = "Goal: " + jstr(intent, "intent");
         }
+        busy_ = "picking the first step";
       }
       wake();
-      const json a = checker_.next_action(jstr(job.data, "goal"), intent, jstr(job.data, "memory"), job.data["history"],
-                                          job.data["snap"], think);
+      const json& snap = job.data["snap"];
+      const double t0 = now_seconds();
+      const json a = checker_.next_action(jstr(job.data, "goal"), intent, jstr(job.data, "memory"), job.data["history"], snap,
+                                          think_step, jstr(snap, "picture"));
+      debug_log("agent: " + std::to_string(static_cast<int>(now_seconds() - t0)) + "s think=" + std::to_string(think_step) +
+                " picture=" + std::to_string(jstr(snap, "picture").size() / 1024) + "KB " + jstr(snap, "url").substr(0, 80) + " -> " +
+                (a.is_object() ? jstr(a, "action") + " #" + std::to_string(a.value("index", -1)) + " \"" + jstr(a, "text") + "\" " +
+                                     jstr(a, "url") + jstr(a, "site") + " | " + jstr(a, "say") + " | eval: " + jstr(a, "evaluation")
+                               : std::string("(no answer)")));
       std::lock_guard lock(mu_);
       busy_.clear();
       if (job.data.value("seq", -1) == task_.seq && task_.state == Task::Thinking) agent_step(a, job.data["snap"]);
@@ -1514,6 +1589,7 @@ void App::start_task(const std::string& command, const json& steps) {
 
 void App::start_agent(const std::string& goal) {
   start_task(goal, json::array());
+  task_log("goal: " + goal);
   task_.agent = true;
   task_.say = "Looking at the page to plan the first step.";
 }
@@ -1525,7 +1601,9 @@ void App::task_next(bool ok, const std::string& note) {
     // A goal goes on after a failed step too: the AI sees what went wrong and tries something else.
     if (ok && note.find("without sound") != std::string::npos) task_.hint = note;
     task_.log.push_back({what + (ok ? "" : " (" + note + ")"), ok});
-    task_.history.push_back(what + (ok ? ": done" : ": failed, " + note));
+    // What a step found out (find on the page) is part of what it did.
+    const bool told = ok && jstr(task_.steps[task_.at], "verb") == "find" && !note.empty();
+    task_.history.push_back(what + (told ? ": " + note : ok ? ": done" : ": failed, " + note));
     task_.desc.clear();
     task_.warn = false;
     task_.fails = ok ? 0 : task_.fails + 1;
@@ -1576,7 +1654,9 @@ void App::task_tick() {
         task_.seq = ++act_seq_;
         task_.state = Task::Snapping;
         task_.since = t;
-        out.push_back({client, {{"type", "snap"}, {"seq", task_.seq}}});
+        // The goal's words are looked for on the whole page, and the AI gets a
+        // picture with every clickable thing numbered.
+        out.push_back({client, {{"type", "snap"}, {"seq", task_.seq}, {"terms", goal_words(task_.command, task_.intent)}, {"picture", true}}});
         wake();
       }
     } else if (task_.state == Task::Snapping && t - task_.since > 30) {
@@ -1676,7 +1756,15 @@ void App::draw_task() {
     case Task::Snapping:
     case Task::Thinking:
       if (task_.agent) {
-        ImGui::TextDisabled(task_.state == Task::Thinking ? "Thinking about the next step..." : "Looking at the page...");
+        // Say what it is waiting for: a step can take a while on a local model.
+        std::string line = "Looking at the page...";
+        if (task_.state == Task::Thinking) {
+          const int secs = static_cast<int>(now_seconds() - task_.since);
+          if (checker_.gpu_busy()) line = "Waiting: another app is using the graphics card memory.";
+          else line = (busy_.empty() ? std::string("thinking") : busy_) + "... " + std::to_string(secs) + " s";
+          line[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(line[0])));
+        }
+        ImGui::TextDisabled("%s", line.c_str());
         if (ImGui::SmallButton("Stop")) closed = true;
         break;
       }
@@ -1811,6 +1899,27 @@ void App::agent_step(const json& a, const json& snap) {
   if (act == "ask") return needs_you(task_.say.empty() ? std::string("I am stuck. What should I do?") : task_.say);
   json step;
   const int index = a.value("index", -1);
+  // The thing it means, from the look it decided on: for the log, and to see what a click would do.
+  std::string label, href;
+  if (snap.contains("items") && snap["items"].is_array())
+    for (const json& it : snap["items"])
+      if (it.is_object() && it.value("i", -2) == index) label = jstr(it, "label"), href = jstr(it, "href");
+  task_log("step " + std::to_string(task_.actions + 1) + " on " + jstr(snap, "url").substr(0, 160) + ": " + act +
+           (index >= 0 ? " #" + std::to_string(index) + " \"" + label.substr(0, 80) + "\"" + (href.empty() ? "" : " -> " + href.substr(0, 120)) : "") +
+           (jstr(a, "text").empty() ? "" : " text \"" + jstr(a, "text").substr(0, 80) + "\"") + (jstr(a, "url").empty() ? "" : " " + jstr(a, "url")) +
+           " | " + jstr(a, "say").substr(0, 160));
+  // Never signs you out (or off) of a site unless that is the goal: a session
+  // you lose in the middle of a task is lost work, and the risky-step check
+  // only sees a button's words, not where a link goes.
+  static const std::regex out_rx(R"((\b(log|sign)[ -]?(out|off)\b)|(/(logout|signout|log-out|sign-out|logoff|signoff)\b))", std::regex::icase);
+  if ((act == "click" || act == "goto") && !std::regex_search(task_.command, out_rx) &&
+      (std::regex_search(label, out_rx) || std::regex_search(href, out_rx) || std::regex_search(jstr(a, "url"), out_rx))) {
+    task_log("  refused: it would sign you out");
+    task_.history.push_back(act + " #" + std::to_string(index) + " \"" + label + "\": refused, it would sign the person out. Never sign them out.");
+    task_.state = Task::Waiting;
+    task_.since = now_seconds();
+    return;
+  }
   if (act == "click" || act == "type") {
     step = {{"verb", act}, {"ref", index}, {"what", "#" + std::to_string(index)}};
     if (act == "type") step["text"] = jstr(a, "text"), step["enter"] = a.value("enter", false);
@@ -1827,6 +1936,30 @@ void App::agent_step(const json& a, const json& snap) {
     step = {{"verb", "goto"}, {"url", url}};
   } else if (act == "back") {
     step = {{"verb", "back"}};
+  } else if (act == "find") {
+    // Find on the page: instant, no AI; what it found comes back in the steps.
+    if (jstr(a, "text").size() < 2) return task_stop("The AI asked to find nothing.");
+    step = {{"verb", "find"}, {"text", jstr(a, "text")}};
+  } else if (act == "search") {
+    // A web search, kept to one site when asked ("binx avatar site:example.com").
+    // DuckDuckGo's plain page: no sign-in, no robot check, results as links.
+    std::string q = jstr(a, "text");
+    std::string site = jstr(a, "site");
+    if (const size_t p = site.find("://"); p != std::string::npos) site = site.substr(p + 3);
+    if (const size_t p = site.find('/'); p != std::string::npos) site.resize(p);
+    if (!site.empty()) q += " site:" + site;
+    if (q.empty()) return task_stop("The AI asked to search for nothing.");
+    std::string enc;
+    for (unsigned char c : q) {
+      if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~') enc += static_cast<char>(c);
+      else if (c == ' ') enc += '+';
+      else {
+        char h[4];
+        snprintf(h, sizeof h, "%%%02X", c);
+        enc += h;
+      }
+    }
+    step = {{"verb", "goto"}, {"url", "https://html.duckduckgo.com/html/?q=" + enc}};
   } else if (act == "key") {
     step = {{"verb", "key"}, {"key", jstr(a, "text")}};
   } else if (act == "play" || act == "pause") {
@@ -1834,6 +1967,8 @@ void App::agent_step(const json& a, const json& snap) {
   } else {
     return task_stop("The AI's answer made no sense. Try saying it another way.");
   }
+  task_.recent.push_back(jstr(step, "verb") == "scroll" ? "scroll " + jstr(step, "dir") : step.dump());
+  if (task_.recent.size() > 6) task_.recent.erase(task_.recent.begin());
   task_.steps = json::array({step});
   task_.at = 0;
   task_.desc.clear();
@@ -2522,6 +2657,13 @@ void App::draw_settings() {
   changed |= ImGui::Checkbox("Check every find as it is harvested", &s.auto_check);
   changed |= ImGui::Checkbox("Check claims in sentences the spider reads or that match your search (slower)", &s.check_sentences);
   changed |= ImGui::Checkbox("Work through the whole page, not only the part you see (it never scrolls your page)", &s.crawl);
+  changed |= ImGui::Checkbox("Close pop-ups that get in the way", &s.close_popups);
+  ImGui::PushFont(small_, small_->LegacySize);
+  ImGui::Indent();
+  ImGui::TextWrapped("Cookie boxes get a no (Reject all, Necessary only); newsletter, app and notification pop-ups get closed. "
+                     "It never agrees to terms or accepts anything for you: those wait for you.");
+  ImGui::Unindent();
+  ImGui::PopFont();
   changed |= ImGui::Checkbox("Show the spider in screen shares and recordings", &s.show_in_shares);
   ImGui::PushFont(small_, small_->LegacySize);
   ImGui::Indent();
@@ -2529,7 +2671,7 @@ void App::draw_settings() {
                      "it steps out of the picture for a moment, so it never reads itself.");
   ImGui::Unindent();
   ImGui::PopFont();
-  changed |= ImGui::Checkbox("Tasks: let the AI think before each step (smarter, slower)", &s.think_tasks);
+  changed |= ImGui::Checkbox("Tasks: let the AI think it over when it plans and when it gets stuck (smarter, slower)", &s.think_tasks);
   ImGui::PushFont(small_, small_->LegacySize);
   ImGui::Indent();
   ImGui::TextWrapped("Thinking picks the right result instead of the first one that has your words. A step takes about "
